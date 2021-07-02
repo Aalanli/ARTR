@@ -6,19 +6,16 @@ import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
 from PIL import Image
+import torchvision.transforms.functional as F
+
 
 # %%
-data_root = 'dataset/val2017'
-with open('dataset/annotations/instances_val2017.json', 'r') as f:
+data_root = 'datasets/coco/val2017'
+with open('datasets/coco/annotations/instances_val2017.json', 'r') as f:
     annote = json.load(f)
 print(annote.keys())
 
 # %%
-print(annote['annotations'][0].keys())
-# %%
-
-print(annote['annotations'][3].keys())
-
 def id_to_file(id: str, dir: str) -> str:
     id = str(id)
     file = '0' * (12 - len(id)) + id + '.jpg'
@@ -38,16 +35,35 @@ def plot_box(image: np.ndarray, bbox: List) -> None:
             ax.add_patch(rect)
     plt.show()
 
-
+# %%
+img = Image.fromarray(np.random.uniform(0.0, 1.0, [128, 128, 3]), mode='RGB')
+img = F.crop(img, 64, 60, 10, 90)
+plt.imshow(img)
+plt.show()
 
 # %%
 image_ids = {}
 for i in annote['annotations']:
     if i['image_id'] in image_ids:
-        image_ids[i['image_id']].append(i['bbox'])
+        if i['category_id'] in image_ids[i['image_id']]:
+            image_ids[i['image_id']][i['category_id']].append(i['bbox'])
+        else:
+            image_ids[i['image_id']].update({i['category_id']: [i['bbox']]})
     else:
-        image_ids[i['image_id']] = [i['bbox']]
+        image_ids[i['image_id']] = {i['category_id']: [i['bbox']]}
 
+# %%
+for k in image_ids:
+    for id, bbox in image_ids[k].items():
+        img = Image.open(id_to_file(k, data_root))
+        plot_box(img, bbox)
+        bbox = bbox[0]
+        print(bbox)
+        img = F.crop(img, bbox[1], bbox[0], bbox[3], bbox[2])
+        plt.imshow(img)
+        plt.show()
+        break
+    break
 # %%
 def sample_dist(images_dict):
     for id in images_dict:
@@ -60,4 +76,6 @@ def sample_dist(images_dict):
 sampler = sample_dist(image_ids)
 
 # %%
-next(sampler)
+import random
+s = {1:2, 2:3}
+print(random.choices(list(s.keys()), k=1))
