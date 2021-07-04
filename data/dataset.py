@@ -15,7 +15,9 @@ from pycocotools import mask as coco_mask
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
 
-# %%
+import data.transforms as T
+
+
 def format_json(json_file):
     """Formats coco json by grouping features by their image_ids"""
     with open(json_file, 'r') as f:
@@ -94,7 +96,7 @@ def visualize_coco(i, q, b):
         plt.imshow(i)
         plt.show()
 
-# %%
+
 class CocoBoxes(Dataset):
     def __init__(self, image_dir: str, json_file: str, query_transforms=None, transforms=None, query_pool: str=None, case4_prob=0.5, case4_sigma=3) -> None:
         """
@@ -182,9 +184,6 @@ class CocoBoxes(Dataset):
 
         img = Image.open(img_path)  # the target image
         bboxes = np.asarray(bboxes[img_class])  # all the boxes in that class belonging to the target image
-
-        if self.transforms is not None:
-            img, bboxes = self.transforms(img, bboxes)
         
         # get queries
         if self.query_pool is not None and random.random() < self.case4_prob:
@@ -196,7 +195,71 @@ class CocoBoxes(Dataset):
             queries = [fetch_query(img, q) for q in queries]
         
         if self.query_transforms is not None:
-            queries = self.query_transforms(queries)
+            # pass empty dict as there are no boxes to be transformed
+            queries = [self.query_transforms(q, {})[0] for q in queries]
+        
+        bboxes = torch.as_tensor(bboxes)
+        # from [x, y, w, h] to [x, y, x1, y1], for transforms
+        bboxes[:, 2] = bboxes[:, 0] + bboxes[:, 2]
+        bboxes[:, 3] = bboxes[:, 1] + bboxes[:, 3]
+        
+        # format for transform functions
+        bboxes = {'boxes': bboxes}
 
-        return img, queries, bboxes
+        if self.transforms is not None:
+            img, bboxes = self.transforms(img, bboxes)
+        
+        # img.shape = [C, H, W]; both img, queries and bboxes are normalized
+        return img, queries, bboxes['boxes']
+
+
+def img_transforms(image_set):
+    normalize = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+
+    if image_set == 'train':
+        return T.Compose([
+            T.RandomHorizontalFlip(),
+            T.RandomSelect(
+                T.RandomResize(scales, max_size=1333),
+                T.Compose([
+                    T.RandomResize([400, 500, 600]),
+                    T.RandomSizeCrop(384, 600),
+                    T.RandomResize(scales, max_size=1333),
+                ])
+            ),
+            normalize,
+        ])
+
+    if image_set == 'val':
+        return T.Compose([
+            T.RandomResize([800], max_size=1333),
+            normalize,
+        ])
+
+    raise ValueError(f'unknown {image_set}')
+
+def query_transforms():
+    normalize = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+
+    return T.Compose([
+        T.RandomHorizontalFlip(),
+        T.RandomSelect(
+            T.RandomResize(scales, max_size=1333),
+            T.Compose([
+                T.RandomResize([400, 500, 600]),
+                T.RandomResize(scales, max_size=1333),
+            ])
+        ),
+        normalize,
+    ])
 
