@@ -76,6 +76,7 @@ def sample_dist(images_dict):
 sampler = sample_dist(image_ids)
 
 # %%
-import random
-s = {1:2, 2:3}
-print(random.choices(list(s.keys()), k=1))
+import torch
+
+a = torch.tensor([[1, 2, 3], [2, -1, 2], [4, 2, 213]]).type(torch.float32)
+print(torch.nn.functional.softmax(a, dim=-1))
