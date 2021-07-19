@@ -131,3 +131,6 @@ dmypy.json
 
 # Datasets
 datasets/
+
+# Training workspace
+experiments/
