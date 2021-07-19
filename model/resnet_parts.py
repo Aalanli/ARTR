@@ -4,14 +4,14 @@ Mostly copy paste from https://github.com/facebookresearch/detr
 (Personally, I despise the 'NestedTensor' abstraction)
 """
 # %%
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 import torchvision
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
-
-#from .position_encoding import build_position_encoding
 
 
 class FrozenBatchNorm2d(torch.nn.Module):
@@ -54,6 +54,7 @@ class FrozenBatchNorm2d(torch.nn.Module):
 
 
 class BackboneBase(nn.Module):
+
     def __init__(self, backbone: nn.Module, train_backbone: bool, num_channels: int, return_interm_layers: bool):
         super().__init__()
         for name, parameter in backbone.named_parameters():
@@ -66,15 +67,13 @@ class BackboneBase(nn.Module):
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
 
-    def forward(self, image):
-        xs = self.body(image)
-        """out: Dict[str, NestedTensor] = {}
+    def forward(self, input, mask):
+        xs = self.body(input)
+        out = {}
         for name, x in xs.items():
-            m = tensor_list.mask
-            assert m is not None
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
-            out[name] = NestedTensor(x, mask)"""
-        return xs
+            mask = F.interpolate(mask[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+            out[name] = (x, mask)
+        return out
 
 
 class Backbone(BackboneBase):
@@ -89,19 +88,4 @@ class Backbone(BackboneBase):
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
-
-class Joiner(nn.Sequential):
-    def __init__(self, backbone, position_embedding):
-        super().__init__(backbone, position_embedding)
-
-    def forward(self, tensor_list):
-        xs = self[0](tensor_list)
-        out = []
-        pos = []
-        for name, x in xs.items():
-            out.append(x)
-            # position encoding
-            pos.append(self[1](x).to(x.dtype))
-
-        return out, pos
 
