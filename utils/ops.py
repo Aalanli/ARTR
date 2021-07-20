@@ -1,3 +1,4 @@
+from typing import Tuple
 import torch
 from torchvision.ops.boxes import box_area
 
@@ -74,3 +75,45 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
+
+
+def _max_by_axis(the_list):
+    maxes = the_list[0]
+    for sublist in the_list[1:]:
+        for index, item in enumerate(sublist):
+            maxes[index] = max(maxes[index], item)
+    return maxes
+
+
+def nested_tensor_from_tensor_list(tensor_list, mask_list=None, exclude_mask_dim=-2) -> Tuple[torch.Tensor, torch.Tensor]:
+    # TODO make this more general
+    max_size = _max_by_axis([list(img.shape) for img in tensor_list])
+    # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
+    batch_shape = [len(tensor_list)] + max_size
+    mask_shape = batch_shape[:exclude_mask_dim] + batch_shape[exclude_mask_dim + 1:]
+    dtype = tensor_list[0].dtype
+    device = tensor_list[0].device
+    tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+    mask = torch.ones(mask_shape, dtype=torch.bool, device=device)
+    
+    i = 0
+    if tensor_list[0].ndim == 3:
+        for img, pad_img, m in zip(tensor_list, tensor, mask):
+            pad_img[:img.shape[0], :img.shape[1], :img.shape[2]].copy_(img)
+            if mask_list is None:
+                m[:img.shape[1], :img.shape[2]] = False
+            else:
+                m[:img.shape[1], :img.shape[2]].copy_(mask_list[i])
+            i += 1
+    elif tensor_list[0].ndim == 4:
+        for img, pad_img, m in zip(tensor_list, tensor, mask):
+            pad_img[:img.shape[0], :img.shape[1], :img.shape[2], :img.shape[3]].copy_(img)
+            if mask_list is None:
+                m[:img.shape[1], :img.shape[2], :img.shape[3]] = False
+            else:
+                m[:img.shape[1], :img.shape[2], img.shape[3]].copy_(mask_list[i])
+            i += 1
+    else:
+        raise ValueError('not supported')
+    return tensor, mask
+
