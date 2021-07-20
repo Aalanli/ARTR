@@ -7,6 +7,8 @@ from torch import nn
 from torch.nn import init
 from torch.utils import checkpoint
 
+from matplotlib import pyplot as plt
+
 
 class PositionEmbeddingSine(nn.Module):
     """
@@ -24,8 +26,7 @@ class PositionEmbeddingSine(nn.Module):
             scale = 2 * math.pi
         self.scale = scale
 
-    def forward(self, input, mask):
-        x = input
+    def forward(self, mask):
         assert mask is not None
         not_mask = ~mask
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
@@ -35,10 +36,10 @@ class PositionEmbeddingSine(nn.Module):
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
             x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
 
-        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=mask.device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
 
-        pos_x = x_embed[:, :, :, None] / dim_t
+        pos_x = x_embed[:, :, :, None] / dim_t  # [batch, y, x, num_pos_feats]
         pos_y = y_embed[:, :, :, None] / dim_t
         pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
@@ -46,6 +47,7 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
 
+# %%
 def split_heads(x: torch.Tensor, heads: int):
     # shape = [batch, sequence, features]
     # split features into heads; size = [batch, heads, sequence, depth]
@@ -181,9 +183,4 @@ class DecoderLayer(nn.Module):
         x = x + self.dropout(x1)
         x = self.norm3(x)
         return x
-
-        
-
-
-
 
