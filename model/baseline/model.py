@@ -2,12 +2,13 @@
 from typing import List
 
 import torch
+from torch._C import dtype
 import torch.nn.functional as F
 from torch import nn
 
 from model.transformer import EncoderLayer, DecoderLayer, PositionEmbeddingSine
 from model.resnet_parts import Backbone
-from utils.ops import nested_tensor_from_tensor_list
+from utils.ops import nested_tensor_from_tensor_list, max_by_axis
 
 class Transformer(nn.Module):
     def __init__(
@@ -71,43 +72,57 @@ class ARTR(nn.Module):
         self.bbox_embed = MLP(d_model, d_model, 4, 3)
         self.query_embed = nn.Parameter(torch.Tensor(num_queries, d_model))
         torch.nn.init.normal_(self.query_embed)
+        self.query_proj = nn.Parameter(torch.Tensor(num_queries, num_queries))
+        torch.nn.init.normal_(self.query_proj)
         self.input_proj = nn.Conv2d(self.backbone.num_channels, d_model, kernel_size=1)
     
-    def forward(self, tar_im: List[torch.Tensor], query_im = List[List[torch.Tensor]]):
-        """len(tar_im) = batch_size, len(query_im) = batch_size, len(query_im[i]) = # of query images for tar_im[i]"""
+    def forward(self, tar_im: List[torch.Tensor], query_im: List[List[torch.Tensor]], dist: torch.Tensor) -> torch.Tensor:
+        """
+        len(tar_im) = batch_size, len(query_im) = batch_size, len(query_im[i]) = # of query images for tar_im[i]
+        dist.shape = [batch_size]; a scaler difference between the bounding boxes and query images 
+        """
         tar_im, t_mask = nested_tensor_from_tensor_list(tar_im)
-        t_features, t_mask = self.backbone(tar_im, t_mask)      # [batch, num_channels, x, y]
-        t_features = self.input_proj(t_features)                # [batch, d_model, x, y]
-        t_pos = self.pos_embed(t_mask)                          # [batch, d_model, x, y]
-        t_features = t_features.flatten(2).transpose(-1, -2)    # [batch, x*y, d_model]
-        t_pos = t_pos.flatten(2).transpose(-1, -2)              # [batch, x*y, d_model]
-        t_mask = t_mask.flatten(1)                              # [batch, x*y]
-
+        t_features, t_mask = self.backbone(tar_im, t_mask)['0']   # [batch, num_channels, x, y]
+        t_features = self.input_proj(t_features)                  # [batch, d_model, x, y]
+        t_pos = self.pos_embed(t_mask)                            # [batch, x, y, d_model]
+        t_features = t_features.flatten(2).transpose(-1, -2)      # [batch, x*y, d_model]
+        t_pos = t_pos.reshape(list(t_features.shape))             # [batch, x*y, d_model]
+        t_mask = t_mask.flatten(1)                                # [batch, x*y]
+        
         q_features = []
         q_mask = []
+        q_pos = []
         for q in query_im:
+            # treat each query as a batch
             qf, qm = nested_tensor_from_tensor_list(q)
+            qf, qm = self.backbone(qf, qm)['0']                   # [n, 3, x1, y1], [n, x1, y1]
+            qf = self.input_proj(qf).transpose(1, 0).flatten(1)   # [d_model, n*x1*y1]
+            qpos = self.pos_embed(qm).transpose(-1, 0).flatten(1) # [d_model, n*x1*y1]
+            qm = qm.flatten(0)                                    # [n*x1*y1]
             q_features.append(qf)
             q_mask.append(qm)
-        q_features, q_mask = nested_tensor_from_tensor_list(q_features, q_mask, exclude_mask_dim=-3)
-        # [batch, n, 3, x1, y1], [batch, n, x1, y1]
-        for b in range(q_features.shape[0]):
-            q_features[b], q_mask[b] = self.backbone(q_features[b], q_mask[b])
-            q_features[b] = self.input_proj(q_features[b])
-            q_mask[b] = self.pos_embed(q_mask[b])
-        # [batch, n, d_model, x1, x2], [batch, n, x1, x2]
-        q_pos = torch.empty_like(q_features)
-        for qp in q_pos:
-            qp.copy_(self.pos_embed(qp))
-        q_features = q_features.transpose(2, 1).flatten(2).transpose(-1, -2)  # [batch, n*x1*y1, d_model]
-        q_mask = q_mask.flatten(1)                                            # [batch, n*x1*y1]
-        q_pos = q_pos.transpose_(2, 1).flatten(2).transpose_(-1, -2)          # [batch, n*x1*y1, d_model]
+            q_pos.append(qpos)
+        max_len = max([i.shape[0] for i in q_mask])
+        for b in range(len(q_mask)):
+            # pad across aggregated samples
+            # pad with zeros
+            q_features[b] = F.pad(q_features[b], (0, max_len - q_features[b].shape[-1]))
+            q_pos[b] = F.pad(q_pos[b], (0, max_len - q_pos[b].shape[-1]))
+            # pad with ones
+            q_mask[b] = torch.cat([q_mask[b], torch.ones(max_len - q_mask[b].shape[-1], dtype=torch.bool, device=q_mask[b].device)])
+        
+        q_features, q_mask, q_pos = map(lambda x: torch.stack(x), (q_features, q_mask, q_pos))
 
-        query_embed = self.query_embed.unsqueeze(1).repeat(1, q_features.shape[0], 1)
+        q_features = q_features.transpose(-1, -2)                 # [batch, n*x1*y1, d_model]
+        q_pos = q_pos.transpose(-1, -2)                           # [batch, n*x1*y1, d_model]
 
+        # transform the queries by the difference scalar
+        query_proj = (self.query_proj.unsqueeze(-1) * (dist + 1e-6)).transpose(-1, 0)  # [batch, num_queries, num_queries]
+        query_embed = query_proj @ self.query_embed                                    # [batch, num_queries, d_model]
+
+        print(q_features.shape, t_features.shape, q_pos.shape, t_pos.shape)
         out = self.transformer(q_features, t_features, query_embed, q_mask, t_mask, q_pos, t_pos)
 
         output_class = self.class_embed(out)
         output_bbox = self.bbox_embed(out).sigmoid()
         return {'pred_logits': output_class, 'pred_boxes': output_bbox[-1]}
-
