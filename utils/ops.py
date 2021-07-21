@@ -77,7 +77,7 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-def _max_by_axis(the_list):
+def max_by_axis(the_list):
     maxes = the_list[0]
     for sublist in the_list[1:]:
         for index, item in enumerate(sublist):
@@ -85,9 +85,9 @@ def _max_by_axis(the_list):
     return maxes
 
 
-def nested_tensor_from_tensor_list(tensor_list, mask_list=None, exclude_mask_dim=-2) -> Tuple[torch.Tensor, torch.Tensor]:
+def nested_tensor_from_tensor_list(tensor_list, mask_list=None, exclude_mask_dim=-3) -> Tuple[torch.Tensor, torch.Tensor]:
     # TODO make this more general
-    max_size = _max_by_axis([list(img.shape) for img in tensor_list])
+    max_size = max_by_axis([list(img.shape) for img in tensor_list])
     # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
     batch_shape = [len(tensor_list)] + max_size
     mask_shape = batch_shape[:exclude_mask_dim] + batch_shape[exclude_mask_dim + 1:]
