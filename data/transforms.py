@@ -12,45 +12,7 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
 
-from utils.ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
-
-
-def unnormalize_box(w, h, box):
-    box = box * torch.tensor([w, h, w, h], dtype=torch.float32)
-    return box_cxcywh_to_xyxy(box)
-
-
-def xyxy_to_cwh(bbox):
-    bbox = np.asarray(bbox)
-    bbox = np.reshape(bbox, [-1, 4])
-    for i, box in enumerate(bbox):
-        bbox[i] = np.array([box[0], box[1], (box[2] - box[0]), (box[3] - box[1])])
-    return bbox
-
-
-def unnormalize(tensor: torch.Tensor, mean: List[float], std: List[float], inplace=False):
-    """inverse of F.normalize"""
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError('Input tensor should be a torch tensor. Got {}.'.format(type(tensor)))
-
-    if tensor.ndim < 3:
-        raise ValueError('Expected tensor to be a tensor image of size (..., C, H, W). Got tensor.size() = '
-                         '{}.'.format(tensor.size()))
-
-    if not inplace:
-        tensor = tensor.clone()
-
-    dtype = tensor.dtype
-    mean = torch.as_tensor(mean, dtype=dtype, device=tensor.device)
-    std = torch.as_tensor(std, dtype=dtype, device=tensor.device)
-    if (std == 0).any():
-        raise ValueError('std evaluated to zero after conversion to {}, leading to division by zero.'.format(dtype))
-    if mean.ndim == 1:
-        mean = mean.view(-1, 1, 1)
-    if std.ndim == 1:
-        std = std.view(-1, 1, 1)
-    tensor.mul_(std).add_(mean)
-    return tensor
+from utils.ops import box_xyxy_to_cxcywh
 
 
 def crop(image, target, region):
