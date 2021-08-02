@@ -6,16 +6,16 @@ import math
 
 import numpy as np
 import torch
-import torchvision
-import torchvision.transforms.functional as F
 from torch.utils.data import Dataset
 
+import torchvision.transforms.functional as F
 from PIL import Image
-from pycocotools import mask as coco_mask
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
+from tqdm import tqdm
 
 import data.transforms as T
+from utils.ops import nested_tensor_from_tensor_list
 
 
 def format_json(json_file):
@@ -35,6 +35,13 @@ def format_json(json_file):
     return image_ids
 
 
+def id_to_file(id: str, image_dir) -> str:
+    """image_id to file name"""
+    id = str(id)
+    file = '0' * (12 - len(id)) + id + '.jpg'
+    return image_dir + '/' + file
+
+
 def fetch_query(image, bbox):
     """
     Fetches query images, alias to cropping
@@ -44,14 +51,19 @@ def fetch_query(image, bbox):
     """
     if type(image) == str:
         image = Image.open(image, mode='RGB')
-    return F.crop(image, bbox[1], bbox[0], bbox[3], bbox[2])
-
-
-def id_to_file(id: str, image_dir) -> str:
-    """image_id to file name"""
-    id = str(id)
-    file = '0' * (12 - len(id)) + id + '.jpg'
-    return image_dir + '/' + file
+    w, h = image.size
+    x, y, w1, h1 = bbox
+    # if the bbox has zero width
+    if w1 < 1 or h1 < 1:
+        return None
+    # if top point is outside the image
+    if x < 0 or y < 0 or x > w or y > h:
+        return None
+    # if bottom point is outside the image
+    x1, y1 = x + w1, y + h1
+    if x1 < 0 or y1 < 0 or x1 > w or y1 > h:
+        return None
+    return F.crop(image, y, x, h1, w1)
 
 
 def make_query_pool(image_dir, json_file, name):
@@ -59,7 +71,7 @@ def make_query_pool(image_dir, json_file, name):
         os.mkdir(name)
     image_ids = format_json(json_file)
     classes_counter = {}
-    for id in image_ids:
+    for id in tqdm(image_ids):
         file = id_to_file(id, image_dir)
         img = Image.open(file)
         for class_id in image_ids[id]:
@@ -69,6 +81,9 @@ def make_query_pool(image_dir, json_file, name):
                 classes_counter[int(class_id)] = 0
             for bbox in image_ids[id][class_id]:
                 query: Image.Image = fetch_query(img, bbox)
+                if query is None:
+                    print('broken box')
+                    continue
                 query.save(path + '/' + str(classes_counter[class_id]) + '.jpg')
                 classes_counter[class_id] += 1
     with open(name + '/instances.json', 'w') as f:
@@ -76,7 +91,7 @@ def make_query_pool(image_dir, json_file, name):
     print('done')
 
 
-def plot_box(image: np.ndarray, bbox) -> None:
+def plot_box(image, bbox: np.ndarray) -> None:
     bbox = np.asarray(bbox)
     plt.imshow(image)
     ax = plt.gca()
@@ -141,7 +156,7 @@ class CocoBoxes(Dataset):
                 # to prevent loading all file paths into memory
                 self.query_instances = json.load(f)
         
-        print('{json_file} loaded into memory.')
+        print(f'{json_file} loaded into memory.')
     
     def random_query_bbox(self, bboxes: np.ndarray):
         """
@@ -156,10 +171,10 @@ class CocoBoxes(Dataset):
     def random_query(self, class_id: int, sigma: int=4.0) -> Image.Image:
         """
         Draws queries from the class, the amount of which follows
-        a normal distribution with mean 1 and stddev 4
+        a normal distribution with mean 0 and stddev 4
         """
-        size = random.normalvariate(1.0, sigma)
-        size = math.floor(abs(size)) + 1  # make sure that size is not 0
+        size = random.normalvariate(0.0, sigma)
+        size = math.floor(abs(size)) + 1  # make sure that size is not 0 or negative
         folder_path = os.path.join(self.query_pool, str(class_id))
         queries = []
         indx = 0
@@ -185,6 +200,8 @@ class CocoBoxes(Dataset):
         img = Image.open(img_path)  # the target image
         bboxes = np.asarray(bboxes[img_class])  # all the boxes in that class belonging to the target image
         
+        assert bboxes.shape[0] != 0
+        
         # get queries
         if self.query_pool is not None and random.random() < self.case4_prob:
             # queries are pulled from disk at location self.query_pool
@@ -198,19 +215,20 @@ class CocoBoxes(Dataset):
             # pass empty dict as there are no boxes to be transformed
             queries = [self.query_transforms(q, {})[0] for q in queries]
         
-        bboxes = torch.as_tensor(bboxes)
+        bboxes = torch.as_tensor(bboxes, dtype=torch.float32)
+        og_box = bboxes.clone()
         # from [x, y, w, h] to [x, y, x1, y1], for transforms
         bboxes[:, 2] = bboxes[:, 0] + bboxes[:, 2]
         bboxes[:, 3] = bboxes[:, 1] + bboxes[:, 3]
-        
         # format for transform functions
         bboxes = {'boxes': bboxes}
 
-        if self.transforms is not None:
-            img, bboxes = self.transforms(img, bboxes)
-        
-        # img.shape = [C, H, W]; both img, queries and bboxes are normalized
-        return img, queries, bboxes['boxes']
+        while True:
+            if self.transforms is not None:
+                img_, bboxes_ = self.transforms(img, bboxes)
+            if bboxes_['boxes'].shape[0] != 0:
+                # img.shape = [C, H, W]; both img, queries and bboxes are normalized
+                return img_, nested_tensor_from_tensor_list(queries), bboxes_['boxes']
 
 
 def img_transforms(image_set):
@@ -263,3 +281,9 @@ def query_transforms():
         normalize,
     ])
 
+
+def collate_fn(batch):
+    img = [i[0] for i in batch]
+    query_im = [i[1] for i in batch]
+    bboxes = [i[2] for i in batch]
+    return nested_tensor_from_tensor_list(img), query_im, bboxes
