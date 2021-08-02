@@ -63,6 +63,8 @@ class MLP(nn.Module):
 class ARTR(nn.Module):
     def __init__(self, backbone_args: List, pos_embed_args: List, transformer_args: List, num_queries: int):
         super().__init__()
+        self.config_ = [backbone_args, pos_embed_args, transformer_args, num_queries]
+
         self.backbone = Backbone(*backbone_args)
         self.pos_embed = PositionEmbeddingSine(*pos_embed_args)
         self.transformer = Transformer(*transformer_args)
@@ -76,12 +78,13 @@ class ARTR(nn.Module):
         torch.nn.init.normal_(self.query_proj)
         self.input_proj = nn.Conv2d(self.backbone.num_channels, d_model, kernel_size=1)
     
-    def forward(self, tar_im: List[torch.Tensor], query_im: List[List[torch.Tensor]], dist: torch.Tensor) -> torch.Tensor:
+    def forward(self, tar_im: torch.Tensor, query_im: List[torch.Tensor], dist: torch.Tensor, t_mask: torch.Tensor=None, query_mask: List[torch.Tensor]=None) -> torch.Tensor:
         """
         len(tar_im) = batch_size, len(query_im) = batch_size, len(query_im[i]) = # of query images for tar_im[i]
         dist.shape = [batch_size]; a scaler difference between the bounding boxes and query images 
         """
-        tar_im, t_mask = nested_tensor_from_tensor_list(tar_im)
+        if isinstance(tar_im, (list, torch.Tensor)):
+            tar_im, t_mask = nested_tensor_from_tensor_list(tar_im)
         t_features, t_mask = self.backbone(tar_im, t_mask)['0']   # [batch, num_channels, x, y]
         t_features = self.input_proj(t_features)                  # [batch, d_model, x, y]
         t_pos = self.pos_embed(t_mask)                            # [batch, x, y, d_model]
@@ -92,9 +95,12 @@ class ARTR(nn.Module):
         q_features = []
         q_mask = []
         q_pos = []
-        for q in query_im:
+        for i, q in enumerate(query_im):
             # treat each query as a batch
-            qf, qm = nested_tensor_from_tensor_list(q)
+            if isinstance(tar_im, (list, torch.Tensor)):
+                qf, qm = nested_tensor_from_tensor_list(q)
+            else:
+                qf, qm = q, query_mask[i]
             qf, qm = self.backbone(qf, qm)['0']                   # [n, 3, x1, y1], [n, x1, y1]
             qf = self.input_proj(qf).transpose(1, 0).flatten(1)   # [d_model, n*x1*y1]
             qpos = self.pos_embed(qm).transpose(-1, 0).flatten(1) # [d_model, n*x1*y1]
@@ -120,9 +126,14 @@ class ARTR(nn.Module):
         query_proj = (self.query_proj.unsqueeze(-1) * (dist + 1e-6)).transpose(-1, 0)  # [batch, num_queries, num_queries]
         query_embed = query_proj @ self.query_embed                                    # [batch, num_queries, d_model]
 
-        print(q_features.shape, t_features.shape, q_pos.shape, t_pos.shape)
         out = self.transformer(q_features, t_features, query_embed, q_mask, t_mask, q_pos, t_pos)
 
         output_class = self.class_embed(out)
         output_bbox = self.bbox_embed(out).sigmoid()
         return {'pred_logits': output_class, 'pred_boxes': output_bbox[-1]}
+    
+    @property
+    def config(self):
+        return self.config_
+    
+
