@@ -144,7 +144,7 @@ def pad(image, target, padding):
     return padded_image, target
 
 
-class RandomCrop(object):
+class RandomCrop:
     def __init__(self, size):
         self.size = size
 
@@ -153,7 +153,7 @@ class RandomCrop(object):
         return crop(img, target, region)
 
 
-class RandomSizeCrop(object):
+class RandomSizeCrop:
     def __init__(self, min_size: int, max_size: int):
         self.min_size = min_size
         self.max_size = max_size
@@ -165,7 +165,7 @@ class RandomSizeCrop(object):
         return crop(img, target, region)
 
 
-class CenterCrop(object):
+class CenterCrop:
     def __init__(self, size):
         self.size = size
 
@@ -177,7 +177,7 @@ class CenterCrop(object):
         return crop(img, target, (crop_top, crop_left, crop_height, crop_width))
 
 
-class RandomHorizontalFlip(object):
+class RandomHorizontalFlip:
     def __init__(self, p=0.5):
         self.p = p
 
@@ -187,7 +187,7 @@ class RandomHorizontalFlip(object):
         return img, target
 
 
-class RandomResize(object):
+class RandomResize:
     def __init__(self, sizes, max_size=None):
         assert isinstance(sizes, (list, tuple))
         self.sizes = sizes
@@ -198,7 +198,7 @@ class RandomResize(object):
         return resize(img, target, size, self.max_size)
 
 
-class RandomPad(object):
+class RandomPad:
     def __init__(self, max_pad):
         self.max_pad = max_pad
 
@@ -208,7 +208,7 @@ class RandomPad(object):
         return pad(img, target, (pad_x, pad_y))
 
 
-class RandomSelect(object):
+class RandomSelect:
     """
     Randomly selects between transforms1 and transforms2,
     with probability p for transforms1 and (1 - p) for transforms2
@@ -224,12 +224,12 @@ class RandomSelect(object):
         return self.transforms2(img, target)
 
 
-class ToTensor(object):
+class ToTensor:
     def __call__(self, img, target):
         return F.to_tensor(img), target
 
 
-class RandomErasing(object):
+class RandomErasing:
 
     def __init__(self, *args, **kwargs):
         self.eraser = T.RandomErasing(*args, **kwargs)
@@ -238,7 +238,15 @@ class RandomErasing(object):
         return self.eraser(img), target
 
 
-class Normalize(object):
+class CompleteAugment:
+    def __init__(self):
+        self.augment = T.AutoAugment()
+    
+    def __call__(self, img, target):
+        return self.augment(img), target
+
+
+class Normalize:
     def __init__(self, mean, std):
         self.mean = mean
         self.std = std
@@ -257,7 +265,7 @@ class Normalize(object):
         return image, target
 
 
-class Compose(object):
+class Compose:
     def __init__(self, transforms):
         self.transforms = transforms
 
