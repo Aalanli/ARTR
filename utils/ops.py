@@ -190,16 +190,6 @@ def l2_query_distance_vectorized(image: torch.Tensor, query: torch.Tensor, q_mas
     return dist
 
 
-def l2_query_distance(image: torch.Tensor, query: List[torch.Tensor], query_mask: List[torch.Tensor], bbox: List[torch.Tensor]):
-    """
-    vectorized
-    image.shape = [batch_size, 3, x, y]
-    query = [batch_size, n, 3, x1, y1]
-    bbox = [batch_size, n1, 4]
-    """
-
-
-
 def give_grad_copy(model):
     grads = []
     for i in model.parameters():
