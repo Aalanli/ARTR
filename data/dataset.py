@@ -1,23 +1,22 @@
 # %%
-import json
 import os
-import random
 import math
-from collections import OrderedDict
+import random
+import json
 from typing import List
 
 import numpy as np
+
 import torch
+import torchvision.transforms.functional as F
 from torch.utils.data import Dataset
 
-import torchvision.transforms.functional as F
 from PIL import Image
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
 from tqdm import tqdm
 
 import data.transforms as T
-from utils.ops import nested_tensor_from_tensor_list
 from utils.similarity import metric_functions
 
 
@@ -51,6 +50,7 @@ def fetch_query(image, bbox, mode='xywh'):
     Args:
         image: str or PIL.Image
         bbox: coco annotation format; x, y of top most point, x right, y down from that point
+        mode: the format of the bbox
     modes:
         xywh, xyxy
     """
@@ -79,6 +79,7 @@ def fetch_query(image, bbox, mode='xywh'):
 
 
 def make_query_pool(image_dir, json_file, name):
+    """constructs the instance query pool, saves a counter dictionary at location image_dir"""
     if not os.path.exists(name):
         os.mkdir(name)
     image_ids = format_json(json_file)
@@ -101,6 +102,18 @@ def make_query_pool(image_dir, json_file, name):
     with open(name + '/instances.json', 'w') as f:
         json.dump(classes_counter, f)
     print('done')
+
+
+def remap_image_names(json_file, im_dir, save_name):
+    """Renames the coco dataset images to contiguous integer names"""
+    im_ids = format_json(json_file)
+    new_ids = {}
+    for i, name in tqdm(enumerate(im_ids)):
+        file_name = id_to_file(name, im_dir)
+        os.rename(file_name, os.path.join(im_dir, str(i) + '.jpg'))
+        new_ids[i] = im_ids[name]
+    with open(os.path.dirname(json_file) + f'/{save_name}', 'w') as f:
+        json.dump(new_ids, f)
 
 
 def plot_box(image, bbox: np.ndarray) -> None:
@@ -143,7 +156,7 @@ def compute_highest_similarity(queries: List[Image.Image], im: Image.Image, bbox
 
 
 class CocoBoxes(Dataset):
-    def __init__(self, image_dir: str, json_file: str, query_transforms=None, transforms=None, query_pool: str=None, case4_prob=0.5, case4_sigma=3) -> None:
+    def __init__(self, image_dir: str, json_file: str, query_transforms=None, transforms=None, query_pool: str=None, case4_prob=0.9, case4_sigma=3) -> None:
         """
         Dataset class which gives bounding boxes, query images respective input images
         for arbitrary bounding box detection following four cases.
@@ -190,7 +203,8 @@ class CocoBoxes(Dataset):
         
         print(f'{json_file} loaded into memory.')
     
-    def random_query_bbox(self, bboxes: np.ndarray):
+    @staticmethod
+    def random_query_bbox(bboxes: np.ndarray):
         """
         For cases 1 to 3
         """
@@ -232,8 +246,6 @@ class CocoBoxes(Dataset):
         img = Image.open(img_path).convert("RGB")  # the target image
         bboxes = np.asarray(bboxes[img_class])  # all the boxes in that class belonging to the target image
         
-        assert bboxes.shape[0] != 0
-        
         # get queries
         if self.query_pool is not None and random.random() < self.case4_prob:
             # queries are pulled from disk at location self.query_pool
@@ -261,75 +273,29 @@ class CocoBoxes(Dataset):
         queries = [self.normalize(q, {})[0] for q in queries]
         img, bboxes = self.normalize(img, bboxes)
         # img.shape = [C, H, W]; both img, queries and bboxes are normalized
-        return img, nested_tensor_from_tensor_list(queries), bboxes['boxes'], similarity_score
+        return img, queries, bboxes['boxes'], similarity_score
     
     @staticmethod
     def collate_fn(batch):
         img = [i[0] for i in batch]
         query_im = [i[1] for i in batch]
         bboxes = [i[2] for i in batch]
-        similarity_scores = torch.tensor([i[3]] for i in batch)
-        return nested_tensor_from_tensor_list(img), query_im, bboxes, similarity_scores
-
-
-class FeatureQueries(Dataset):
-    """For the feature extractor"""
-    def __init__(self, query_pool):
-        with open(os.path.join(query_pool, 'instances.json'), 'r') as f:
-            # query instances describes range of file names under each class
-            # to prevent loading all file paths into memory
-            self.query_instances = json.load(f)
-        self.query_pool = query_pool
-        self.classes = [k for k in self.query_instances]
-        self.classes.sort()
-        self.len = sum([self.query_instances[k] for k in self.classes])
-        self.transforms = query_transforms()
-        print('loaded instances')
-    
-    def __len__(self):
-        return self.len
-    
-    def __getitem__(self, index):
-        collected_sum = 0
-        for k in self.classes:
-            collected_sum += self.query_instances[k]
-            if collected_sum > index:
-                im_path = os.path.join(self.query_pool, k, str(collected_sum - index - 1) + '.jpg')
-                im = Image.open(im_path).convert('RGB')
-                im, imt = self.transforms(im, {})[0], self.transforms(im, {})[0]
-                return im, imt, k
-    
-    @staticmethod
-    def collate_fn(batch):
-        im_o = OrderedDict()
-        im_t = OrderedDict()
-        for im, im_, c in batch:
-            if c not in im_o:
-                im_o[c] = [im]
-                im_t[c] = [im_]
-            else:
-                im_o[c].append(im)
-                im_t[c].append(im_)
-        if random.uniform(0, 1) > 0.5:
-            for k in im_t:
-                random.shuffle(im_t[k])
-        im_o = nested_tensor_from_tensor_list([x for k in im_o for x in im_o[k]], exclude_mask_dim=-2)
-        im_t = nested_tensor_from_tensor_list([x for k in im_t for x in im_t[k]], exclude_mask_dim=-2)
-        return im_o[0], im_t[0]
+        similarity_scores = torch.tensor([[i[3]] for i in batch])
+        return img, query_im, bboxes, similarity_scores
 
 
 def img_transforms(image_set):
-    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+    scales = [352, 384, 416, 448, 480, 512, 544, 576, 608, 640, 672]
 
     if image_set == 'train':
         return T.Compose([
             T.RandomHorizontalFlip(),
             T.RandomSelect(
-                T.RandomResize(scales, max_size=1333),
+                T.RandomResize(scales, max_size=672),
                 T.Compose([
                     T.RandomResize([400, 500, 600]),
                     T.RandomSizeCrop(384, 600),
-                    T.RandomResize(scales, max_size=1333),
+                    T.RandomResize(scales, max_size=672),
                 ])
             ),
         ])
@@ -357,16 +323,14 @@ def query_transforms():
         #T.CompleteAugment(),
     ])
 
+
 # %%
 def testing():
     root = "datasets/coco/"
     data = CocoBoxes(root + 'val2017', root + 'annotations/instances_val2017.json',
                      query_transforms=query_transforms(), transforms=img_transforms('train'),
                      query_pool=root + 'val2017_query_pool')
-    for i in range(50):
-        im, q, b, s = data[i]
-        print(len(q), b.shape, im.shape)
-        print(s)
+    print(data.keys)
 
 if __name__ == "__main__":
     testing()
