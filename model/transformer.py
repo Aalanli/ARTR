@@ -7,8 +7,6 @@ from torch import nn
 from torch.nn import init
 from torch.utils import checkpoint
 
-from matplotlib import pyplot as plt
-
 
 class PositionEmbeddingSine(nn.Module):
     """
@@ -46,6 +44,28 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
 
+class PositionEmbeddingSineMaskless(PositionEmbeddingSine):
+    def forward(self, im: torch.Tensor):
+        c, h, w = im.shape
+        y_embed = torch.arange(0, h, 1, dtype=im.dtype, device=im.device).unsqueeze_(1).tile(1, w)
+        x_embed = torch.arange(0, w, 1, dtype=im.dtype, device=im.device).unsqueeze_(0).tile(h, 1)
+
+        if self.normalize:
+            eps = 1e-6
+            y_embed = y_embed / (y_embed[-1:, :] + eps) * self.scale
+            x_embed = x_embed / (x_embed[:, -1:] + eps) * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=im.dtype, device=im.device)
+        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+
+        pos_x = x_embed[:, :, None] / dim_t  # [batch, y, x, num_pos_feats]
+        pos_y = y_embed[:, :, None] / dim_t
+        pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+        pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
+        pos = torch.cat((pos_y, pos_x), dim=2)
+        return pos
+
+
 class FixedPositionalEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len):
         super().__init__()
@@ -59,7 +79,6 @@ class FixedPositionalEmbedding(nn.Module):
         return self.emb[None, :x.shape[1], :].to(x)
 
 
-# %%
 def split_heads(x: torch.Tensor, heads: int):
     # shape = [batch, sequence, features]
     # split features into heads; size = [batch, heads, sequence, depth]
@@ -85,7 +104,7 @@ def multihead_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask=None)
     w = w / math.sqrt(depth)
 
     if mask is not None:
-        w = w.masked_fill(mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+        w = w.masked_fill(mask, float('-inf'))
     
     a = w.softmax(-1)
     out = a @ v
