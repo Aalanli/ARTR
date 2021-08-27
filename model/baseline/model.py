@@ -39,13 +39,11 @@ class Transformer(nn.Module):
         for layer in self.enc_t:
             im_target = layer(im_target, key_padding_mask_t, pos_t)
 
-        attn_2d_mask = mask_q[:, :, None].logical_or(mask_t[:, None, :])
-        attn_2d_mask.unsqueeze_(1)         # [batch, 1, L, D]
         x = torch.zeros_like(query_embed)  # flow-through variable
         kv = torch.zeros_like(im_query)    # flow-through variable
         for kv_layer, out_layer in zip(self.dec_kv, self.dec_final):
-            kv = kv_layer(kv, im_query, im_target, attn_2d_mask, pos_t)
-            x = out_layer(x, query_embed, kv, key_padding_mask_q, pos_q)
+            kv = kv_layer(kv, im_query, im_target, mask_q=key_padding_mask_q, mask_k=key_padding_mask_t, pos_q=pos_q, pos_k=pos_t)
+            x = out_layer(x, query_embed, kv, mask_k=key_padding_mask_q, pos_k=pos_q)
         return x
 
 
@@ -122,7 +120,7 @@ class ARTR(nn.Module):
         pos_embed = []
         for i in range(len(ims)):
             ims[i] = self.backbone(ims[i].unsqueeze_(0))['0']
-            ims[i] = self.input_proj(ims[i]).squeeze()
+            ims[i] = self.input_proj(ims[i]).squeeze(0)
             pos_embed.append(self.make_pos_embed(ims[i]))
             ims[i] = ims[i].flatten(1)
         pos_embed = make_equal1D(pos_embed)  # no grad
@@ -140,7 +138,7 @@ class ARTR(nn.Module):
             pos_embed_ = []
             for i in range(len(qrs[j])):
                 qrs[j][i] = self.backbone(qrs[j][i].unsqueeze_(0))['0']
-                qrs[j][i] = self.input_proj(qrs[j][i]).squeeze()
+                qrs[j][i] = self.input_proj(qrs[j][i]).squeeze(0)                
                 pos_embed_.append(self.make_pos_embed(qrs[j][i]))
                 qrs[j][i] = qrs[j][i].flatten(1)
             # [embed_dim, n * x * y]
@@ -168,7 +166,7 @@ class ARTR(nn.Module):
         out = self.transformer(q_features, t_features, query_embed, q_mask, t_mask, q_pos, t_pos)
         output_class = self.class_embed(out)
         output_bbox = self.bbox_embed(out).sigmoid()
-        return {'pred_logits': output_class, 'pred_boxes': output_bbox[-1]}
+        return {'pred_logits': output_class, 'pred_boxes': output_bbox}
     
     @property
     def config(self):

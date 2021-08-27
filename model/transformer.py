@@ -197,17 +197,18 @@ class DecoderLayer(nn.Module):
     def apply_pos(self, x, pos):
         return x if pos is None else x + pos
     
-    def forward(self, x, query, memory, mask=None, pos=None):
+    def forward(self, x, query, memory, mask_q=None, mask_k=None, pos_q=None, pos_k=None):
+        query = self.apply_pos(query, pos_q)
         q = k = self.apply_pos(x, query)
-        x1 = self.attn1(q, k, x)[0]
+        x1 = self.attn1(q, k, x, mask=mask_q)[0]
         x = x + self.dropout(x1)
         x = self.norm1(x)
         
         x1 = self.attn2(
             self.apply_pos(x, query),
-            self.apply_pos(memory, pos),
+            self.apply_pos(memory, pos_k),
             memory,
-            mask=mask)[0]
+            mask=mask_k)[0]
         x = x + self.dropout(x1)
         x = self.norm2(x)
         x1 = self.linear2(self.dropout(self.activation(self.linear1(x))))
