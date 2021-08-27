@@ -263,6 +263,7 @@ class CocoBoxes(Dataset):
         # from [x, y, w, h] to [x, y, x1, y1], for transforms
         bboxes[:, 2] = bboxes[:, 0] + bboxes[:, 2]
         bboxes[:, 3] = bboxes[:, 1] + bboxes[:, 3]
+
         # format for transform functions
         bboxes = {'boxes': bboxes}
 
@@ -272,6 +273,7 @@ class CocoBoxes(Dataset):
         #similarity_score = compute_highest_similarity(queries, img, bboxes['boxes'].numpy())
         queries = [self.normalize(q, {})[0] for q in queries]
         img, bboxes = self.normalize(img, bboxes)
+        assert (bboxes['boxes'] > 0).all()
         # img.shape = [C, H, W]; both img, queries and bboxes are normalized
         return img, queries, bboxes['boxes']#, similarity_score
     
@@ -280,7 +282,7 @@ class CocoBoxes(Dataset):
         img = [i[0] for i in batch]
         query_im = [i[1] for i in batch]
         #similarity_scores = torch.tensor([[i[3]] for i in batch])
-        target = [{'labels': torch.zeros(b.shape[0]), 'boxes': b} for _, _, b in batch]
+        target = [{'labels': torch.zeros(b.shape[0], dtype=torch.int64), 'boxes': b} for _, _, b in batch]
         return img, query_im, target
 
 
