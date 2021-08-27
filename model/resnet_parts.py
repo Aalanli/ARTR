@@ -66,8 +66,10 @@ class BackboneBase(nn.Module):
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
 
-    def forward(self, input, mask):
+    def forward(self, input, mask=None):
         xs = self.body(input)
+        if mask is None:
+            return xs
         out = {}
         for name, x in xs.items():
             mask = F.interpolate(mask[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
