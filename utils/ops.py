@@ -34,7 +34,7 @@ def unnormalize_box(w, h, box):
     return box_cxcywh_to_xyxy(box)
 
 
-def unnormalize(tensor: torch.Tensor, mean: List[float] = [0.485, 0.456, 0.406], 
+def unnormalize_im(tensor: torch.Tensor, mean: List[float] = [0.485, 0.456, 0.406], 
                 std: List[float] = [0.229, 0.224, 0.225], inplace=False):
     """inverse of F.normalize"""
     if not isinstance(tensor, torch.Tensor):
