@@ -269,19 +269,19 @@ class CocoBoxes(Dataset):
         if self.transforms is not None:
             img, bboxes = self.transforms(img, bboxes)
         
-        similarity_score = compute_highest_similarity(queries, img, bboxes['boxes'].numpy())
+        #similarity_score = compute_highest_similarity(queries, img, bboxes['boxes'].numpy())
         queries = [self.normalize(q, {})[0] for q in queries]
         img, bboxes = self.normalize(img, bboxes)
         # img.shape = [C, H, W]; both img, queries and bboxes are normalized
-        return img, queries, bboxes['boxes'], similarity_score
+        return img, queries, bboxes['boxes']#, similarity_score
     
     @staticmethod
     def collate_fn(batch):
         img = [i[0] for i in batch]
         query_im = [i[1] for i in batch]
-        bboxes = [i[2] for i in batch]
-        similarity_scores = torch.tensor([[i[3]] for i in batch])
-        return img, query_im, bboxes, similarity_scores
+        #similarity_scores = torch.tensor([[i[3]] for i in batch])
+        target = [{'labels': torch.zeros(b.shape[0]), 'boxes': b} for _, _, b in batch]
+        return img, query_im, target
 
 
 def img_transforms(image_set):
