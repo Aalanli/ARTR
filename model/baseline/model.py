@@ -16,20 +16,20 @@ class Transformer(nn.Module):
         d_model, 
         heads, 
         proj_forward, 
-        enc_q_nlayers,
-        enc_t_nlayers,
-        dec_nlayers,
+        enc_q_layers,
+        enc_t_layers,
+        dec_layers,
         activation=F.relu,
         dropout=0.1, 
         bias=None):
         super().__init__()
         self.d_model = d_model
         args = [d_model, heads, proj_forward, activation, dropout, bias]
-        self.enc_q = nn.ModuleList([EncoderLayer(*args) for _ in range(enc_q_nlayers)])
-        self.enc_t = nn.ModuleList([EncoderLayer(*args) for _ in range(enc_t_nlayers)])
+        self.enc_q = nn.ModuleList([EncoderLayer(*args) for _ in range(enc_q_layers)])
+        self.enc_t = nn.ModuleList([EncoderLayer(*args) for _ in range(enc_t_layers)])
 
-        self.dec_kv = nn.ModuleList([DecoderLayer(*args) for _ in range(dec_nlayers)])
-        self.dec_final = nn.ModuleList([DecoderLayer(*args) for _ in range(dec_nlayers)])
+        self.dec_kv = nn.ModuleList([DecoderLayer(*args) for _ in range(dec_layers)])
+        self.dec_final = nn.ModuleList([DecoderLayer(*args) for _ in range(dec_layers)])
     
     def forward(self, im_query, im_target, query_embed, mask_q=None, mask_t=None, pos_q=None, pos_t=None):
         key_padding_mask_q = mask_q[:, None, None, :].bool()
@@ -68,17 +68,19 @@ class ARTR(nn.Module):
     def __init__(
         self, 
         backbone_args:    Dict = {'name': 'resnet50', 'train_backbone': True, 'return_interm_layers': False, 'dilation': False}, 
-        pos_embed_args:   Dict = {'num_pos_feats': 128, 'temperature': 10000, 'normalize': False, 'scale': None}, 
-        transformer_args: Dict = {'d_model': 256, 'heads': 8, 'proj_forward': 1024, 'enc_q_nlayers': 3,
-                                  'enc_t_nlayers': 3, 'dec_nlayers': 3, 'activation': F.relu, 'dropout': 0.1, 'bias': None}, 
+        pos_embed_args:   Dict = {'temperature': 10000, 'normalize': False, 'scale': None}, 
+        transformer_args: Dict = {'heads': 8, 'proj_forward': 1024, 'enc_q_layers': 3,
+                                  'enc_t_layers': 3, 'dec_layers': 3, 'activation': F.relu, 'dropout': 0.1, 'bias': None},
+        d_model:          int = 256,
         num_queries:      int  = 50
         ):
         super().__init__()
         # default args
         backbone_args_ = {'name': 'resnet50', 'train_backbone': True, 'return_interm_layers': False, 'dilation': False}
-        pos_embed_args_ = {'num_pos_feats': 128, 'temperature': 10000, 'normalize': False, 'scale': None}
-        transformer_args_ = {'d_model': 256, 'heads': 8, 'proj_forward': 1024, 'enc_q_nlayers': 3,
-                             'enc_t_nlayers': 3, 'dec_nlayers': 3, 'activation': F.relu, 'dropout': 0.1, 'bias': None}
+        pos_embed_args_ = {'num_pos_feats': d_model // 2, 'temperature': 10000, 'normalize': False, 'scale': None}
+        transformer_args_ = {'d_model': d_model, 'heads': 8, 'proj_forward': 1024, 'enc_q_layers': 3,
+                             'enc_t_layers': 3, 'dec_layers': 3, 'activation': F.relu, 'dropout': 0.1, 'bias': None}
+        
         backbone_args_.update(backbone_args)
         pos_embed_args_.update(pos_embed_args)
         transformer_args_.update(transformer_args)
