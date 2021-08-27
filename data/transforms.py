@@ -12,7 +12,7 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
 
-from utils.ops import box_xyxy_to_cxcywh
+from utils.ops import box_xyxy_to_cxcywh, unnormalize_box, unnormalize_im
 
 
 def crop(image, target, region):
@@ -263,6 +263,18 @@ class Normalize:
             boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
         return image, target
+
+
+class UnNormalize:
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, image, boxes):
+        image = unnormalize_im(image, self.mean, self.std)
+        h, w = image.shape[-2:]
+        boxes = unnormalize_box(w, h, boxes)
+        return image, boxes
 
 
 class Compose:
