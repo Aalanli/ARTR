@@ -225,12 +225,12 @@ class CocoBoxes(Dataset):
         queries = []
         indx = 0
         while indx < size:
-            f = random.randint(0, self.query_instances[str(class_id)])
+            f = random.randint(0, self.query_instances[str(class_id)] - 1)
             f = folder_path + '/' + str(f) + '.jpg'
             if f not in queries:
                 queries.append(f)
                 indx += 1
-        return [Image.open(i) for i in queries]
+        return [Image.open(i).convert('RGB') for i in queries]
 
     def __len__(self):
         return len(self.keys)
@@ -273,7 +273,6 @@ class CocoBoxes(Dataset):
         #similarity_score = compute_highest_similarity(queries, img, bboxes['boxes'].numpy())
         queries = [self.normalize(q, {})[0] for q in queries]
         img, bboxes = self.normalize(img, bboxes)
-        assert (bboxes['boxes'] > 0).all()
         # img.shape = [C, H, W]; both img, queries and bboxes are normalized
         return img, queries, bboxes['boxes']#, similarity_score
     
