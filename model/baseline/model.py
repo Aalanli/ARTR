@@ -68,7 +68,7 @@ class ARTR(nn.Module):
         backbone_args:    Dict = {'name': 'resnet50', 'train_backbone': True, 'return_interm_layers': False, 'dilation': False}, 
         pos_embed_args:   Dict = {'temperature': 10000, 'normalize': False, 'scale': None}, 
         transformer_args: Dict = {'heads': 8, 'proj_forward': 1024, 'enc_q_layers': 3,
-                                  'enc_t_layers': 3, 'dec_layers': 3, 'activation': F.relu, 'dropout': 0.1, 'bias': None},
+                                  'enc_t_layers': 3, 'dec_layers': 3, 'activation': 'relu', 'dropout': 0.1, 'bias': None},
         d_model:          int = 256,
         num_queries:      int  = 50
         ):
@@ -77,12 +77,13 @@ class ARTR(nn.Module):
         backbone_args_ = {'name': 'resnet50', 'train_backbone': True, 'return_interm_layers': False, 'dilation': False}
         pos_embed_args_ = {'num_pos_feats': d_model // 2, 'temperature': 10000, 'normalize': False, 'scale': None}
         transformer_args_ = {'d_model': d_model, 'heads': 8, 'proj_forward': 1024, 'enc_q_layers': 3,
-                             'enc_t_layers': 3, 'dec_layers': 3, 'activation': F.relu, 'dropout': 0.1, 'bias': None}
+                             'enc_t_layers': 3, 'dec_layers': 3, 'activation': 'relu', 'dropout': 0.1, 'bias': None}
         
         backbone_args_.update(backbone_args)
         pos_embed_args_.update(pos_embed_args)
         transformer_args_.update(transformer_args)
-        self.config_ = [backbone_args_, pos_embed_args_, transformer_args_, num_queries]
+        self.config_ = [backbone_args_.copy(), pos_embed_args_.copy(), transformer_args_.copy(), num_queries]
+        transformer_args_['activation'] = getattr(F, transformer_args_['activation'])
 
         self.backbone = Backbone(**backbone_args_)
         self.pos_embed = PositionEmbeddingSineMaskless(**pos_embed_args_)
