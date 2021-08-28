@@ -181,11 +181,12 @@ class TrainerV1(Trainer):
             with torch.no_grad():
                 self.model.eval()
                 self.criterion.eval()
-                pred = self.model(x)  # logits = [batch, seq_len, classes]
+                pred = self.model(*x)  # logits = [batch, seq_len, classes]
                 loss_dict = self.criterion(pred, y)
-                weight_dict = self.criterion.weight_dict
+                weight_dict = self.loss_weight_dict
                 losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-                return loss_dict + {'total_loss': float(losses)}
+                loss_dict.update({'total_loss': float(losses)})
+                return loss_dict
     
     @staticmethod
     def call_functions(tensor, attr_args):
@@ -230,15 +231,20 @@ class TrainerV1(Trainer):
                 # average logging across self.metric_step(s)
                 self.sum_scalars(train_losses, new_train_log)
             
-            if eval_data is not None and eval_losses is not None:
+            if eval_data is not None:
                 ims, qrs, target = next(eval_data)
+                self.recursive_cast(ims, {'cuda': []})
+                self.recursive_cast(qrs, {'cuda': []})
+                for t in target:
+                    for k in t:
+                        t[k] = t[k].cuda()
                 new_eval_log = self.eval_step((ims, qrs), target)
                 if eval_losses is None:
                     eval_losses = new_eval_log
                 else:
                     self.sum_scalars(eval_losses, new_eval_log)
 
-            if (self.steps + 1) % self.metric_step:
+            if (self.steps + 1) % self.metric_step == 0:
                 self.log_scalars(summary_writer, train_losses, 'train')
                 self.zero_scalars(train_losses)
                 if eval_data is not None:
