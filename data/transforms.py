@@ -270,10 +270,11 @@ class UnNormalize:
         self.mean = mean
         self.std = std
 
-    def __call__(self, image, boxes):
+    def __call__(self, image, boxes=None):
         image = unnormalize_im(image, self.mean, self.std)
-        h, w = image.shape[-2:]
-        boxes = unnormalize_box(w, h, boxes)
+        if boxes is not None:
+            h, w = image.shape[-2:]
+            boxes = unnormalize_box(w, h, boxes)
         return image, boxes
 
 
