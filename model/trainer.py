@@ -5,11 +5,13 @@ import json
 import pathlib
 from itertools import cycle
 
-import torch
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import torch
+from data.transforms import UnNormalize
+from utils.ops import unnormalize_box
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 class Trainer:
     """The general trainer base class"""
@@ -23,7 +25,8 @@ class Trainer:
         checkpoint_step: int = None, 
         mixed_precision: bool = False, 
         lr_scheduler: bool = None,
-        max_checkpoints: int = 5
+        max_checkpoints: int = 5,
+        config=None
     ) -> None:
     
         self.model = model
@@ -35,6 +38,7 @@ class Trainer:
         self.dir = directory
         self.metric_step = metric_step
         self.checkpoint_step = checkpoint_step
+        self.config = config
 
         self.max_checkpoints_saved = max_checkpoints
         self.steps = 0
@@ -47,8 +51,8 @@ class Trainer:
             else:
                 # first time loading model
                 os.makedirs(self.dir)
-                with open(self.dir + '/model_params.json', 'w') as f:
-                    json.dump(self.model.config, f)
+                with open(self.dir + '/model_params.pkl', 'rw') as f:
+                    dill.dump(config, f)
                 # save a pickled referance of the objects
                 # in case original class and arguments were forgotten
                 with open(os.path.join(self.dir, 'obj_ref.pkl'), 'wb') as f:
@@ -63,7 +67,8 @@ class Trainer:
         return self.__dict__
 
     def restore_objects(self, file):
-        self.__dict__ = torch.load(file)
+        with open(file, 'rb') as f:
+            self.__dict__ = dill.load(f)
 
     def restore_checkpoint(self, file):
         checkpoint = torch.load(file)
@@ -121,39 +126,77 @@ class Trainer:
         for k in log:
             log[k] += new_log[k]
     
+    def div_scalars(self, log: dict, div: int):
+        for k in log:
+            log[k] /= div
+    
     def zero_scalars(self, log: dict):
         for k in log:
             log[k] = 0
     
-    def log_scalars(self, writer: SummaryWriter, log: dict, prefix=''):
+    def log_scalars(self, writer, log: dict, prefix=''):
         for k in log:
             writer.add_scalar(f'{prefix}/{k}', log[k] / self.metric_step, self.steps)
 
 
-class TrainerV1(Trainer):
-    """Specific implementation for baseline"""
+import wandb
+
+class TrainerWandb(Trainer):
     def __init__(
-        self, 
-        model: torch.nn.Module = None, 
-        criterion: torch.nn.Module = None, 
-        optimizer: torch.optim.Optimizer = None, 
-        directory: str = None, 
-        metric_step: int = None, 
-        checkpoint_step: int = None, 
-        mixed_precision: bool = None, 
-        lr_scheduler: bool = None, 
+        self,
+        model: torch.nn.Module,
+        criterion: torch.nn.Module = None,
+        optimizer: torch.optim.Optimizer = None,
+        directory: str = None,
+        metric_step: int = None,
+        checkpoint_step: int = None,
+        log_results_step: int = None,
+        mixed_precision: bool = None,
+        lr_scheduler: bool = None,
         max_checkpoints: int = None,
-        loss_weight_dict: dict = {}) -> None:
-        super().__init__(model, 
-                         criterion=criterion, 
-                         optimizer=optimizer, 
-                         directory=directory, 
-                         metric_step=metric_step, 
-                         checkpoint_step=checkpoint_step, 
-                         mixed_precision=mixed_precision, 
-                         lr_scheduler=lr_scheduler, 
-                         max_checkpoints=max_checkpoints)
-        self.loss_weight_dict = loss_weight_dict
+        config=None) -> None:
+
+        self.model = model
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.mixed_precison = mixed_precision
+        self.scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision)
+        self.dir = directory
+        self.metric_step = metric_step
+        self.checkpoint_step = checkpoint_step
+        self.log_results_step = log_results_step
+        self.config = config
+
+        self.max_checkpoints_saved = max_checkpoints
+        self.steps = 0
+
+        self.checkpointable = ['model', 'criterion', 'optimizer', 'scaler', 'steps']
+        
+        self.id = self.config.name
+        self.loss_weight_dict = self.config.weight_dict
+        self.im_unnormalizer = UnNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+        self.labels = {'real': 0, 'eos': 1, 'true': 2}
+        self.ids = {v: k for k, v in self.labels.items()}
+        
+        
+        if isinstance(self.model, torch.nn.Module):    
+            if os.path.exists(self.dir):
+                self.restore_latest_checkpoint()
+            else:
+                # first time loading model
+                os.makedirs(self.dir)
+                with open(self.dir + '/model_params.pkl', 'wb') as f:
+                    dill.dump(config, f)
+                # save a pickled referance of the objects
+                # in case original class and arguments were forgotten
+                with open(os.path.join(self.dir, 'obj_ref.pkl'), 'wb') as f:
+                    dill.dump(self.obj_ref, f)
+        elif isinstance(self.model, str):
+            # if model is a string to the model directory
+            self.restore_objects(os.path.join(self.model, 'obj_ref.pkl'))
+            self.restore_latest_checkpoint()
 
     def train_step(self, x, y):
         with torch.cuda.amp.autocast(enabled=self.mixed_precison):
@@ -164,8 +207,6 @@ class TrainerV1(Trainer):
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         
         self.steps += 1
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step(self.steps)
         self.optimizer.zero_grad()
         self.scaler.scale(losses).backward()
         self.scaler.step(self.optimizer)
@@ -174,7 +215,7 @@ class TrainerV1(Trainer):
         # disconnect from graph, for logging purposes
         loss = {k: float(v) for k, v in loss_dict.items()}
         loss.update({'total_loss': float(losses)})
-        return loss
+        return loss, self.recursive_cast(pred, {'cpu': []})
     
     def eval_step(self, x, y):
         with torch.cuda.amp.autocast(enabled=self.mixed_precison):
@@ -184,7 +225,7 @@ class TrainerV1(Trainer):
                 pred = self.model(*x)  # logits = [batch, seq_len, classes]
                 loss_dict = self.criterion(pred, y)
                 weight_dict = self.loss_weight_dict
-                losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+                losses = sum(float(loss_dict[k] * weight_dict[k]) for k in loss_dict.keys() if k in weight_dict)
                 loss_dict.update({'total_loss': float(losses)})
                 return loss_dict
     
@@ -196,35 +237,81 @@ class TrainerV1(Trainer):
         return tensor
 
     @staticmethod
-    def recursive_cast(nested_tensor_list: list, attr_args):
-        """Recursively casts nested tensor lists by attr_args, inplace if list, else returns the casted tensor"""
-        if isinstance(nested_tensor_list, list):
-            for i in range(len(nested_tensor_list)):
-                if isinstance(nested_tensor_list[i], torch.Tensor):
-                    nested_tensor_list[i] = TrainerV1.call_functions(nested_tensor_list[i], attr_args)
-                elif isinstance(nested_tensor_list[i], list):
-                    TrainerV1.recursive_cast(nested_tensor_list[i], attr_args)
-        else:
-            return TrainerV1.call_functions(nested_tensor_list, attr_args)
+    def recursive_cast(nested_tensor, attr_args):
+        """Recursively casts nested tensor lists by attr_args, returns new casted results"""
+        if isinstance(nested_tensor, list):
+            nest = []
+            for i in range(len(nested_tensor)):
+                nest.append(TrainerWandb.recursive_cast(nested_tensor[i], attr_args))
+            return nest
+        elif isinstance(nested_tensor, dict):
+            nest = {}
+            for k in nested_tensor:
+                nest[k] = TrainerWandb.recursive_cast(nested_tensor[k], attr_args)
+            return nest
+        return TrainerWandb.call_functions(nested_tensor, attr_args)
+    
+    def log_scalars(self, log: dict, prefix):
+        prefix_copy = {f'{prefix}/{k}': v for k, v in log.items()}
+        wandb.log(prefix_copy, step=self.steps)
+    
+    def log_detection(self, ims, qrs, model_out, prefix, target=None):
+        # only log the first example in the batch
+        bboxes = model_out['pred_boxes'][0]
+        probs = model_out['pred_logits'][0].softmax(-1)
+        class_id = probs.argmax(-1)
+        ims, bboxes = self.im_unnormalizer(ims[0], bboxes)
+        qrs_ex = self.im_unnormalizer(qrs[0][0])[0]
+
+        all_boxes = []
+        if target is not None:
+            target = target[0]
+            h, w = ims.shape[-2:]
+            for b in unnormalize_box(w, h, target['boxes'].cpu()):
+                box_data = {'position' :{
+                'minX': float(b[0]),
+                'maxX': float(b[2]),
+                'minY': float(b[1]),
+                'maxY': float(b[3])},
+                'class_id': 2,
+                'box_caption': f'Target',
+                'domain': 'pixel',
+                'scores': {'score': 1}
+                }
+                all_boxes.append(box_data)
+
+        for i in range(bboxes.shape[0]):
+            box_data = {'position' :{
+                'minX': float(bboxes[i, 0]),
+                'maxX': float(bboxes[i, 2]),
+                'minY': float(bboxes[i, 1]),
+                'maxY': float(bboxes[i, 3])},
+                'class_id': int(class_id[i]),
+                'box_caption': f'{float(probs[i, 0])}% real',
+                'domain': 'pixel',
+                'scores': {'score': float(probs[i, 0])}
+            }
+            all_boxes.append(box_data)
+    
+        images = wandb.Image(ims, caption='target image', boxes={'predictions': {'box_data': all_boxes, 'class_labels': self.ids}})
+        queries = wandb.Image(qrs_ex, caption='image query example')
+        wandb.log({f'images_{prefix}/target': images, f'images_{prefix}/queries': queries}, step=self.steps)
+
 
     def train(self, train_data, eval_data=None):
         """train one epoch"""
-        summary_writer = SummaryWriter(self.dir)
-
         if eval_data is not None:
             eval_data = cycle(eval_data)
             eval_losses: dict = None  # placeholder
 
         train_losses: dict = None  # placeholder
 
-        for ims, qrs, target in train_data:
-            self.recursive_cast(ims, {'cuda': []})
-            self.recursive_cast(qrs, {'cuda': []})
-            for t in target:
-                for k in t:
-                    t[k] = t[k].cuda()
+        for ims, qrs, target in tqdm(train_data, desc='epoch', unit='step'):
+            ims_cu = self.recursive_cast(ims, {'cuda': []})
+            qrs_cu = self.recursive_cast(qrs, {'cuda': []})
+            target = self.recursive_cast(target, {'cuda': []})
  
-            new_train_log = self.train_step((ims, qrs), target)
+            new_train_log, model_out = self.train_step((ims_cu, qrs_cu), target)
             if train_losses is None:
                 train_losses = new_train_log
             else:
@@ -232,25 +319,39 @@ class TrainerV1(Trainer):
                 self.sum_scalars(train_losses, new_train_log)
             
             if eval_data is not None:
-                ims, qrs, target = next(eval_data)
-                self.recursive_cast(ims, {'cuda': []})
-                self.recursive_cast(qrs, {'cuda': []})
-                for t in target:
-                    for k in t:
-                        t[k] = t[k].cuda()
-                new_eval_log = self.eval_step((ims, qrs), target)
+                ims_eval, qrs_eval, target_eval = next(eval_data)
+                ims_eval_cu = self.recursive_cast(ims_eval, {'cuda': []})
+                qrs_eval_cu = self.recursive_cast(qrs_eval, {'cuda': []})
+                target_eval = self.recursive_cast(target_eval, {'cuda': []})
+                
+                new_eval_log, _ = self.eval_step((ims_eval_cu, qrs_eval_cu), target_eval)
                 if eval_losses is None:
                     eval_losses = new_eval_log
                 else:
                     self.sum_scalars(eval_losses, new_eval_log)
-
+            
+            # log scalar metrics
             if (self.steps + 1) % self.metric_step == 0:
-                self.log_scalars(summary_writer, train_losses, 'train')
+                self.div_scalars(train_losses, self.metric_step)
+                self.log_scalars(train_losses, 'train')
                 self.zero_scalars(train_losses)
                 if eval_data is not None:
-                    self.log_scalars(summary_writer, eval_losses, 'eval')
+                    self.div_scalars(eval_losses, self.metric_step)
+                    self.log_scalars(eval_losses, 'eval')
                     self.zero_scalars(eval_losses)
+            if (self.steps + 1) % self.log_results_step == 0:
+                self.log_detection(ims, qrs, model_out, 'train', target=target)
             
             if (self.steps + 1) % self.checkpoint_step == 0:
                 self.regulate_checkpoints()
         self.regulate_checkpoints()  # save final checkpoint
+    
+    def train_epochs(self, epochs, train_data, eval_data=None):
+        run = wandb.init(project='ARTR', entity='allanl', dir=self.dir, id=self.id, resume='allow', config=self.config)
+        wandb.watch(self.model)
+        with run:
+            for i in range(epochs):
+                self.train(iter(train_data), eval_data)
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+    
