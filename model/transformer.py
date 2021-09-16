@@ -8,71 +8,97 @@ from torch.nn import init
 from torch.utils import checkpoint
 
 
-def split_heads(x: torch.Tensor, heads: int):
-    # shape = [batch, sequence, features]
-    # split features into heads; size = [batch, heads, sequence, depth]
-    batch, seq_len, features = x.shape
-    x = x.reshape((batch, seq_len, heads, features // heads))
-    return x.permute(0, 2, 1, 3)
-
-
-def combine_heads(x: torch.Tensor):
-    # inverse operation of split heads
-    batch, heads, seq_len, depth = x.shape
-    x = x.permute(0, 2, 1, 3)
-    return x.reshape((batch, seq_len, heads * depth))
-
-
-def multihead_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask=None):
-    """
-    Most naive implementation
-    mask.shape = [bs, k.shape[-2]]; k.shape[-2] = k_seq_len
-    """
-    depth = q.shape[-1]
-    w = q @ k.transpose(-1, -2)
-    w = w / math.sqrt(depth)
-
-    if mask is not None:
-        w = w.masked_fill(mask, float('-inf'))
+class AlibiMask(nn.Module):
+    def __init__(self, start_ratio=1/2, heads=8, apply=True):
+        super().__init__()
+        self.use = apply
+        self.heads = heads
+        self.start_ratio = start_ratio
+        self.mask = None
     
-    a = w.softmax(-1)
-    out = a @ v
-    return out, a
+    def alibi_mask(self, n, heads):
+        a = torch.arange(0.0, n, 1.0).unsqueeze(0).repeat(n, 1)
+        b = torch.arange(0.0, n, 1.0).unsqueeze(1)
+        a = a - b
+        a = a.unsqueeze(0).repeat(heads, 1, 1)
+        c = torch.tensor([[[self.start_ratio / 2 ** i]] for i in range(heads)])
+        return c * a
+    
+    def forward(self, x):
+        if self.use is False:
+            return None
+        b, seq_len, dim = x.shape
+        if self.mask is None or self.mask.shape[-2] < seq_len:
+            self.mask = self.alibi_mask(seq_len, self.heads).to(x)
+        if self.mask.device != x.device or self.mask.dtype != x.dtype:
+            self.mask = self.mask.to(x)
+        return self.mask[:, :seq_len, :seq_len]
 
 
 class Attention(nn.Module):
-    def __init__(self, d_model, heads, bias=None, self_attn=True):
+    def __init__(self, d_model, heads, bias=False, dropout=0):
         super().__init__()
 
         self.d_model = d_model
         self.heads = heads
         self.b = bias
-        self.self_attn = self_attn  # if q, k, v are the same
 
-        self.w = nn.Parameter(torch.Tensor(d_model * 3, d_model))
-        init.xavier_uniform_(self.w)
-        if self.b:
-            self.b = nn.Parameter(torch.zeros(d_model * 3))
-        self.split_heads = lambda x: split_heads(x, self.heads)
+        self.qw = nn.Linear(d_model, d_model, bias=bias)
+        self.kw = nn.Linear(d_model, d_model, bias=bias)
+        self.vw = nn.Linear(d_model, d_model, bias=bias)
+        
+        self.dropout = nn.Dropout(dropout)
     
+    def split_heads(self, x: torch.Tensor):
+        # shape = [batch, sequence, features]
+        # split features into heads; size = [batch, heads, sequence, depth]
+        batch, seq_len, features = x.shape
+        x = x.reshape((batch, seq_len, self.heads, features // self.heads))
+        return x.permute(0, 2, 1, 3)
+
+    def combine_heads(self, x: torch.Tensor):
+        # inverse operation of split heads
+        batch, heads, seq_len, depth = x.shape
+        x = x.permute(0, 2, 1, 3)
+        return x.reshape((batch, seq_len, heads * depth))
+    
+    def unsqueeze_mask(self, mask: torch.Tensor):
+        if mask.dim() == 2:
+            return mask.unsqueeze(1).unsqueeze(2)
+        raise NotImplementedError(f"mask dim {mask.dim()} not supported")
+
+    def multihead_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask=None, alibi_mask=None):
+        """
+        Most naive implementation
+        mask.shape = [bs, k.shape[-2]]; k.shape[-2] = k_seq_len
+        """
+        depth = q.shape[-1]
+        w = q @ k.transpose(-1, -2)
+        w = w / math.sqrt(depth)
+
+        if mask is not None:
+            w = w.masked_fill(mask, float('-inf'))
+        
+        if alibi_mask is not None:
+            w = w + alibi_mask
+        
+        a = w.softmax(-1)
+        a = self.dropout(a)
+        out = a @ v
+        return out, a
+        
     def attn_proj(self, q, k, v):
         """Transforms the inputs"""
-        if self.self_attn:  # if positional encoding is not injected in every layer
-            # self-attention, singular matrix transform
-            q, k, v = F.linear(q, self.w, self.b).chunk(3, dim=-1)
-        else:  # multiple matrix transforms, as q != v and k != v
-            if self.b is None:
-                q, k, v = map(F.linear, (q, k, v), self.w.chunk(3))
-            else:
-                q, k, v = map(F.linear, (q, k, v), self.w.chunk(3), self.b.chunk(3))
-        
+        q = self.qw(q)
+        k = self.kw(k)
+        v = self.vw(v)
         return q, k, v
     
-    def forward(self, q, k, v, mask=None):
-        q, k, v = self.attn_proj(q, k, v)
+    def forward(self, query, key, value, mask=None, alibi_mask=None):
+        q, k, v = self.attn_proj(query, key, value)
         q, k, v = map(self.split_heads, (q, k, v))
-        out, a = multihead_attn(q, k, v, mask)
-        return combine_heads(out), a
+        out, a = self.multihead_attn(q, k, v, mask, alibi_mask)
+        return self.combine_heads(out), a
 
 
 def checkpoint_wrapper(func, *args, apply=True):
@@ -82,9 +108,9 @@ def checkpoint_wrapper(func, *args, apply=True):
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model, heads, proj_forward, activation=F.relu, dropout=0.1, bias=None):
+    def __init__(self, d_model, heads, proj_forward, activation=F.relu, dropout=0.1, attn_dropout=0.1, bias=None):
         super().__init__()
-        self.attn = Attention(d_model, heads, bias, self_attn=False)        
+        self.attn = Attention(d_model, heads, bias, dropout=attn_dropout)        
 
         self.linear1 = nn.Linear(d_model, proj_forward)
         self.linear2 = nn.Linear(proj_forward, d_model)
@@ -93,12 +119,12 @@ class EncoderLayer(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.activation = activation
 
-    def forward(self, x, mask=None, pos=None):
+    def forward(self, x, mask=None, alibi_mask=None, pos=None):
         if pos is not None:
             q = k = x + pos
         else:
             q = k = x
-        x1 = self.attn(q, k, x, mask)[0]
+        x1 = self.attn(q, k, x, mask, alibi_mask=alibi_mask)[0]
         x = self.drop(x1) + x  # save, non-deterministic
         x = self.norm1(x)
         x1 = self.activation(self.linear1(x))
@@ -110,10 +136,10 @@ class EncoderLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, heads, proj_forward, activation=F.relu, dropout=0.1, bias=None):
+    def __init__(self, d_model, heads, proj_forward, activation=F.relu, dropout=0.1, attn_dropout=0.1, bias=None):
         super().__init__()
-        self.attn1 = Attention(d_model, heads, bias, self_attn=False)
-        self.attn2 = Attention(d_model, heads, bias, self_attn=False)
+        self.attn1 = Attention(d_model, heads, bias, attn_dropout)
+        self.attn2 = Attention(d_model, heads, bias, attn_dropout)
         
         self.linear1 = nn.Linear(d_model, proj_forward)
         self.linear2 = nn.Linear(proj_forward, d_model)
@@ -126,10 +152,10 @@ class DecoderLayer(nn.Module):
     def apply_pos(self, x, pos):
         return x if pos is None else x + pos
     
-    def forward(self, x, query, memory, mask_q=None, mask_k=None, pos_q=None, pos_k=None):
+    def forward(self, x, query, memory, mask_q=None, mask_k=None, alibi_mask=None, pos_q=None, pos_k=None):
         query = self.apply_pos(query, pos_q)
         q = k = self.apply_pos(x, query)
-        x1 = self.attn1(q, k, x, mask=mask_q)[0]
+        x1 = self.attn1(q, k, x, mask=mask_q, alibi_mask=alibi_mask)[0]
         x = x + self.dropout(x1)
         x = self.norm1(x)
         
