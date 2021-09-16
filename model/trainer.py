@@ -161,7 +161,6 @@ class TrainerWandb(Trainer):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.mixed_precison = mixed_precision
-        self.scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision)
         self.dir = directory
         self.metric_step = metric_step
         self.checkpoint_step = checkpoint_step
@@ -180,7 +179,8 @@ class TrainerWandb(Trainer):
         self.labels = {'real': 0, 'eos': 1, 'true': 2}
         self.ids = {v: k for k, v in self.labels.items()}
         
-        
+        self.scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision)
+
         if isinstance(self.model, torch.nn.Module):    
             if os.path.exists(self.dir):
                 self.restore_latest_checkpoint()
@@ -197,6 +197,7 @@ class TrainerWandb(Trainer):
             # if model is a string to the model directory
             self.restore_objects(os.path.join(self.model, 'obj_ref.pkl'))
             self.restore_latest_checkpoint()
+        
 
     def train_step(self, x, y):
         with torch.cuda.amp.autocast(enabled=self.mixed_precison):
@@ -232,8 +233,11 @@ class TrainerWandb(Trainer):
     @staticmethod
     def call_functions(tensor, attr_args):
         """Helper function for recursive_cast"""
-        for k in attr_args:    
-            tensor = tensor.__getattribute__(k)(*attr_args[k])
+        for k in attr_args:
+            try:
+                tensor = tensor.__getattribute__(k)(*attr_args[k])
+            except AttributeError:
+                pass
         return tensor
 
     @staticmethod
@@ -306,7 +310,10 @@ class TrainerWandb(Trainer):
 
         train_losses: dict = None  # placeholder
 
+        metric_accum = 0
         for ims, qrs, target in tqdm(train_data, desc='epoch', unit='step'):
+            metric_accum += 1
+
             ims_cu = self.recursive_cast(ims, {'cuda': []})
             qrs_cu = self.recursive_cast(qrs, {'cuda': []})
             target = self.recursive_cast(target, {'cuda': []})
@@ -332,13 +339,14 @@ class TrainerWandb(Trainer):
             
             # log scalar metrics
             if (self.steps + 1) % self.metric_step == 0:
-                self.div_scalars(train_losses, self.metric_step)
+                self.div_scalars(train_losses, metric_accum)
                 self.log_scalars(train_losses, 'train')
                 self.zero_scalars(train_losses)
                 if eval_data is not None:
-                    self.div_scalars(eval_losses, self.metric_step)
+                    self.div_scalars(eval_losses, metric_accum)
                     self.log_scalars(eval_losses, 'eval')
                     self.zero_scalars(eval_losses)
+                metric_accum = 0
             if (self.steps + 1) % self.log_results_step == 0:
                 self.log_detection(ims, qrs, model_out, 'train', target=target)
             
@@ -355,3 +363,13 @@ class TrainerWandb(Trainer):
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
     
+    def test_model(self, train_data):
+        for i in range(5):
+            ims, qrs, target = next(iter(train_data))
+
+            ims_cu = self.recursive_cast(ims, {'cuda': []})
+            qrs_cu = self.recursive_cast(qrs, {'cuda': []})
+            target = self.recursive_cast(target, {'cuda': []})
+ 
+            new_train_log, model_out = self.train_step((ims_cu, qrs_cu), target)
+            
