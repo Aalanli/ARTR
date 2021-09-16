@@ -27,7 +27,10 @@ def transformer_builder(transformer: Module, args):
         args.transformer_dec_layers,
         args.transformer_activation,
         args.transformer_dropout,
-        args.transformer_bias
+        args.attn_dropout,
+        args.transformer_bias,
+        args.alibi,
+        args.alibi_start_ratio
     )
 
 
@@ -72,13 +75,36 @@ def run_sweep(objects: List[dict], args_list: list, epochs, root_dir, data_dir, 
         optimizer = torch.optim.AdamW(param_dicts, args.lr, weight_decay=args.weight_decay)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
         trainer = TrainerWandb(model, criterion, optimizer, os.path.join(root_dir, args.name), 
-                               metric_step, checkpoint_step, results_step, False, lr_scheduler, 5, config=args)
+                               metric_step, checkpoint_step, results_step, args.mixed_precision, lr_scheduler, 5, config=args)
         
-        train_set = data.CocoBoxes(data_dir + '/train2017', data_dir + '/annotations/instances_train2017.json',
-                                   data.query_transforms(), data.img_transforms('train'), data_dir + '/train2017_query_pool',
-                                   args.mirror_prob, args.case4_sigma, args.case4_mu, args.min_query_dim)
-        train_set = torch.utils.data.DataLoader(train_set, args.batch_size, True, num_workers=4, collate_fn=data.CocoBoxes.collate_fn)        
+        root = "datasets/coco/"
+        proc = 'train'
+        query_process = data.GetQuery(data.query_transforms(), args.query_mu, args.query_std, stretch_limit=args.query_stretch_limit, min_size=args.min_query_dim,
+                                      query_pool=root + proc + "2017_query_pool", prob_pool=args.query_pool_prob, max_queries=args.max_queries)
+
+        dataset = data.CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', data.img_transforms('train'), query_process)
+        train_set = torch.utils.data.DataLoader(dataset, args.batch_size, True, num_workers=8, collate_fn=data.collate_fn)        
         trainer.train_epochs(epochs, train_set)
 
         del model, criterion, param_dicts, optimizer, lr_scheduler, train_set, trainer
 
+
+def run_test_sweep(objects: List[dict], args_list: list):
+    for s in range(len(args_list)):
+        sweep = objects[s]
+        args = args_list[s]
+
+        backbone = sweep['backbone']
+        transformer = sweep['transformer']
+        artr = sweep['artr']
+
+        model = model_builder(artr, transformer, backbone, args)
+        ims = misc.gen_test_data(512, 64, 4)
+        qrs = [misc.gen_test_data(256, 64, 2) for i in range(4)]
+
+        try:
+            a = model(ims, qrs)
+            print(args.name, "passed with no errors")
+            print("output shape: ", a.shape)
+        except Exception as e:
+            print(e)
