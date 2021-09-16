@@ -1,288 +1,198 @@
 # %%
 import os
-import math
-import random
 import json
+import random
 from typing import List
 
+import torch
+import torchvision
+import torchvision.transforms.functional as F
+from PIL import Image
 import numpy as np
 
-import torch
-import torchvision.transforms.functional as F
-from torch.utils.data import Dataset
-
-from PIL import Image
-from matplotlib import pyplot as plt
-from matplotlib.patches import Rectangle
-from tqdm import tqdm
-
 import data.transforms as T
-from utils.similarity import metric_functions
 
 
-def format_json(json_file):
-    """Formats coco json by grouping features by their image_ids"""
-    with open(json_file, 'r') as f:
-        annote = json.load(f)
-    
-    image_ids = {}  # key = image_ids, item = nested dict classes and their bounding boxes
-    for i in annote['annotations']:
-        if i['image_id'] in image_ids:
-            if i['category_id'] in image_ids[i['image_id']]:
-                image_ids[i['image_id']][i['category_id']].append(i['bbox'])
-            else:
-                image_ids[i['image_id']].update({i['category_id']: [i['bbox']]})
-        else:
-            image_ids[i['image_id']] = {i['category_id']: [i['bbox']]}
-    return image_ids
-
-
-def id_to_file(id: str, image_dir) -> str:
-    """image_id to file name"""
-    id = str(id)
-    file = '0' * (12 - len(id)) + id + '.jpg'
-    return image_dir + '/' + file
-
-
-def fetch_query(image, bbox, mode='xywh'):
-    """
-    Fetches query images, alias to cropping
-    Args:
-        image: str or PIL.Image
-        bbox: coco annotation format; x, y of top most point, x right, y down from that point
-        mode: the format of the bbox
-    modes:
-        xywh, xyxy
-    """
-    if type(image) == str:
-        image = Image.open(image, mode='RGB')
-    if type(image) == torch.Tensor:
-        h, w = image.shape[-2:]
-    elif type(image) == Image.Image:
-        w, h = image.size
-    if mode == 'xywh':
-        x, y, w1, h1 = bbox
-    elif mode == 'xyxy':
-        x, y, x1, y1 = bbox
-        w1, h1 = x1 - x, y1 - y
-    # if the bbox has zero width
-    if w1 < 1 or h1 < 1:
-        return None
-    # if top point is outside the image
-    if x < 0 or y < 0 or x > w or y > h:
-        return None
-    # if bottom point is outside the image
-    x1, y1 = x + w1, y + h1
-    if x1 < 0 or y1 < 0 or x1 > w or y1 > h:
-        return None
-    return F.crop(image, y, x, h1, w1)
-
-
-def make_query_pool(image_dir, json_file, name):
-    """constructs the instance query pool, saves a counter dictionary at location image_dir"""
-    if not os.path.exists(name):
-        os.mkdir(name)
-    image_ids = format_json(json_file)
-    classes_counter = {}
-    for id in tqdm(image_ids):
-        file = id_to_file(id, image_dir)
-        img = Image.open(file)
-        for class_id in image_ids[id]:
-            path = name + '/' + str(class_id)
-            if not os.path.exists(path):
-                os.mkdir(path)
-                classes_counter[int(class_id)] = 0
-            for bbox in image_ids[id][class_id]:
-                query: Image.Image = fetch_query(img, bbox)
-                if query is None:
-                    print('broken box')
-                    continue
-                query.save(path + '/' + str(classes_counter[class_id]) + '.jpg')
-                classes_counter[class_id] += 1
-    with open(name + '/instances.json', 'w') as f:
-        json.dump(classes_counter, f)
-    print('done')
-
-
-def remap_image_names(json_file, im_dir, save_name):
-    """Renames the coco dataset images to contiguous integer names"""
-    im_ids = format_json(json_file)
-    new_ids = {}
-    for i, name in tqdm(enumerate(im_ids)):
-        file_name = id_to_file(name, im_dir)
-        os.rename(file_name, os.path.join(im_dir, str(i) + '.jpg'))
-        new_ids[i] = im_ids[name]
-    with open(os.path.dirname(json_file) + f'/{save_name}', 'w') as f:
-        json.dump(new_ids, f)
-
-
-def plot_box(image, bbox: np.ndarray) -> None:
-    bbox = np.asarray(bbox)
-    plt.imshow(image)
-    ax = plt.gca()
-    if len(bbox.shape) == 1:
-        rect = Rectangle(bbox[:2], bbox[2], bbox[3], linewidth=1, edgecolor='r', facecolor='none')
-        ax.add_patch(rect)
-    else:
-        for box in bbox:
-            rect = Rectangle(box[:2], box[2], box[3], linewidth=1, edgecolor='r', facecolor='none')
-            ax.add_patch(rect)
-    plt.show()
-
-
-def visualize_coco(i, q, b):
-    plot_box(i, b)
-    for i in q:
-        plt.imshow(i)
-        plt.show()
-
-
-def compute_image_similarity(x, y, alpha=0.5):
-    """score between 0 and 1; 1 is most similar"""
-    return metric_functions['fsim'](x, y) * alpha + metric_functions['ssim'](x, y) * (1 - alpha)
-
-
-def compute_highest_similarity(queries: List[Image.Image], im: Image.Image, bboxes: torch.Tensor, alpha=0.5, mode='xyxy'):
-    score = 0
-    if bboxes.shape[0] == 0: return score
-    im_bbox = [fetch_query(im, i, mode=mode) for i in bboxes]
-    for q in queries:
-        scores = []
-        for b in im_bbox:
-            b = b.resize(q.size)
-            scores.append(compute_image_similarity(np.asarray(q), np.asarray(b), alpha=alpha))
-        score += max(scores)
-    return score
-
-
-class CocoBoxes(Dataset):
-    def __init__(self, image_dir: str, json_file: str, query_transforms=None, transforms=None, query_pool: str=None, case4_prob=0.9, case4_sigma=3) -> None:
-        """
-        Dataset class which gives bounding boxes, query images respective input images
-        for arbitrary bounding box detection following four cases.
-
-        Case1: One query image is matched to its bounding box, from the same image.
-
-        Case2: Multiple query images are matched to multiple bounding boxes, from the same image.
-
-        Case3: Multiple query images are matched to all the bounding boxes, all sampled from the same image.
-
-        Case4: Some query images are pulled from the same class as the bounding boxes, all bounding boxes of
-               image belonging to that class is given.
-
-        For cases 1 to 3, all query images must have their own bounding box, but not all bounding
-        boxes needs to have a direct matching to one of the query images.
-
-        Args:
-            query_pool: whether to activative case4 or not, if not None, indicates the directory of the query
-                        pool, which is constructed by the make_query_pool function.
-            
-            case4_prob: the probability of entering case4 if query_pool is not None.
-
-            case4_sigma: the stddev of the amount of images to draw from the query pool
-        """
-
-        self.image_dir = image_dir
-        self.json_file = json_file
-        self.transforms = transforms
+class CocoDetection(torchvision.datasets.CocoDetection):
+    def __init__(self, img_folder, ann_file, transforms, get_query):
+        super(CocoDetection, self).__init__(img_folder, ann_file)
+        self._transforms = transforms
+        self.prepare = VectorizeData()
+        self.get_query = get_query
         self.normalize = T.Compose([T.ToTensor(),
-                                    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-        self.query_transforms = query_transforms
-        self.query_pool = query_pool
-        self.case4_prob = case4_prob
-        self.case4_sigma = case4_sigma
+                               T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+    def __getitem__(self, idx):
+        """target['boxes'] = [x, y, x1, y1] top left corner, bottom right corner"""
+        img, target = super(CocoDetection, self).__getitem__(idx)
+        image_id = self.ids[idx]
+        target = {'image_id': image_id, 'annotations': target}
+        img, target = self.prepare(img, target)
 
-        self.image_ids = format_json(json_file)
-        self.keys = list(self.image_ids.keys())
+        if self._transforms is not None:
+            img, target = self._transforms(img, target)
+        img, qrs, target = self.get_query(img, target)
+
+        img, target = self.normalize(img, target)
+        qrs = [self.normalize(qr, {})[0] for qr in qrs]
+        return img, qrs, target
+
+
+class VectorizeData:
+    """Tensorizes data output"""
+    def __call__(self, image, target):
+        w, h = image.size
+
+        anno = target["annotations"]
+
+        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
+
+        boxes = [obj["bbox"] for obj in anno]
+        # guard against no boxes via resizing
+        boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        boxes[:, 2:] += boxes[:, :2]
+        boxes[:, 0::2].clamp_(min=0, max=w)
+        boxes[:, 1::2].clamp_(min=0, max=h)
+
+        classes = [obj["category_id"] for obj in anno]
+        classes = torch.tensor(classes, dtype=torch.int64)
+
+        keypoints = None
+        if anno and "keypoints" in anno[0]:
+            keypoints = [obj["keypoints"] for obj in anno]
+            keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
+            num_keypoints = keypoints.shape[0]
+            if num_keypoints:
+                keypoints = keypoints.view(num_keypoints, -1, 3)
+
+        keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
+        boxes = boxes[keep]
+        classes = classes[keep]
+
+        if keypoints is not None:
+            keypoints = keypoints[keep]
+
+        target = {}
+        target["boxes"] = boxes
+        target["labels"] = classes
+        if keypoints is not None:
+            target["keypoints"] = keypoints
+
+        # for conversion to coco api
+        iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
+        target["iscrowd"] = iscrowd[keep]
+
+        target["orig_size"] = torch.as_tensor([int(h), int(w)])
+        target["size"] = torch.as_tensor([int(h), int(w)])
+
+        return image, target
+
+
+class GetQuery:
+    def __init__(self, transforms, mean_amount, std_amount, min_size=None, stretch_limit=0.3, query_pool=None, max_queries=10, prob_pool=0.1) -> None:
+        self.transforms = transforms
+        self.mean = mean_amount
+        self.std = std_amount
+        self.min_size = min_size
+        self.stretch_limit = stretch_limit
+        self.max_queries = max_queries
+        self.query_pool = query_pool
+        self.prob_pool = max(0, min(1, prob_pool))
 
         if query_pool is not None:
             with open(os.path.join(query_pool, 'instances.json'), 'r') as f:
                 # query instances describes range of file names under each class
                 # to prevent loading all file paths into memory
                 self.query_instances = json.load(f)
-        
-        print(f'{json_file} loaded into memory.')
+
+    def random_size(self) -> int:
+        return min(int(abs(random.normalvariate(self.mean - 1, self.std)) + 1), self.max_queries)
+
+    def fetch_query(self, im, boxes) -> List[Image.Image]:
+        boxes = boxes.tolist()
+        return [F.crop(im, b[1], b[0], b[3], b[2]) for b in boxes]
     
-    @staticmethod
-    def random_query_bbox(bboxes: np.ndarray):
-        """
-        For cases 1 to 3
-        """
-        q = len(bboxes)
-        indx = np.random.permutation(q)
-        q_stop = random.randint(1, q)
-        b_stop = random.randint(q_stop, q)
-        return bboxes[indx[:q_stop]], bboxes[indx[:b_stop]]  # query images, bboxes; query images <= bboxes
+    def stretch_queries(self, queries: List[Image.Image]) -> List[Image.Image]:
+        """resizes queries to make them more similar in shape"""
+        stretch = random.uniform(0, self.stretch_limit)
+        widths = np.array([im.width for im in queries])
+        heights = np.array([im.height for im in queries])
+        w_dist = (widths - widths.mean()) * stretch
+        h_dist = (heights - heights.mean()) * stretch
+        widths = widths - w_dist
+        heights = heights - h_dist
+        queries = [im.resize((int(w), int(h))) for im, w, h in zip(queries, widths, heights)]
+        return queries
+
+    def random_class(self, target):
+        classes = target['labels']
+        if classes.shape[0] == 0:
+            return
+        keep = torch.multinomial(torch.ones_like(classes, dtype=torch.float32), num_samples=1)
+        keep = classes[keep] == classes
+        target['boxes'] = target['boxes'][keep]
+        target['obj label'] = int(classes[keep][0])
     
-    def random_query(self, class_id: int, sigma: int=4.0) -> Image.Image:
-        """
-        Draws queries from the class, the amount of which follows
-        a normal distribution with mean 0 and stddev 4
-        """
-        size = random.normalvariate(0.0, sigma)
-        size = math.floor(abs(size)) + 1  # make sure that size is not 0 or negative
-        folder_path = os.path.join(self.query_pool, str(class_id))
+    def sample_query_from_pool(self, samples, label):
+        folder_path = os.path.join(self.query_pool, str(label))
         queries = []
         indx = 0
-        while indx < size:
-            f = random.randint(0, self.query_instances[str(class_id)] - 1)
+        while indx < samples:
+            f = random.randint(0, self.query_instances[str(label)] - 1)
             f = folder_path + '/' + str(f) + '.jpg'
-            if f not in queries:
-                queries.append(f)
+            im = Image.open(f)
+            if self.min_size is None:
+                queries.append(im.convert('RGB'))
                 indx += 1
-        return [Image.open(i).convert('RGB') for i in queries]
-
-    def __len__(self):
-        return len(self.keys)
-    
-    def __getitem__(self, index):
-        if torch.is_tensor(index):
-            index = index.tolist()
+            elif im.width > self.min_size and im.height > self.min_size:
+                queries.append(im.convert('RGB'))
+                indx += 1
+        return queries
         
-        img_path = id_to_file(self.keys[index], self.image_dir)
-        bboxes = self.image_ids[self.keys[index]]
-        img_class: int = random.choices(list(bboxes.keys()), k=1)[0]  # randomly chose an image class to preform detection
+    def random_query(self, img, target) -> List[Image.Image]:
+        bboxes = target['boxes'].clone()
+        # dealing with zero box cases
+        if bboxes.shape[0] == 0 and self.query_pool is not None:
+            # get a random sample from the query pool
+            label = random.sample(self.query_instances.keys(), 1)[0]
+            return self.sample_query_from_pool(self.random_size(), label)
+        elif bboxes.shape[0] == 0:
+            # get some random noise
+            sizes = [(random.randint(32, 128), random.randint(32, 128)) for _ in range(self.random_size())]
+            return [Image.fromarray(np.random.randint(0, 255, size=(h, w, 3)), mode='RGB') for (h, w) in sizes]
 
-        img = Image.open(img_path).convert("RGB")  # the target image
-        bboxes = np.asarray(bboxes[img_class])  # all the boxes in that class belonging to the target image
+        bboxes[:, 2:] -= bboxes[:, :2]
+        if self.min_size is not None:
+            keep = (bboxes[:, 2] > self.min_size).logical_and(bboxes[:, 3] > self.min_size)
+            # size could be zero, filter by or instead
+            if not keep.any():
+                keep = (bboxes[:, 2] > self.min_size).logical_or(bboxes[:, 3] > self.min_size)
+            if keep.any():
+                bboxes = bboxes[keep]
         
-        # get queries
-        if self.query_pool is not None and random.random() < self.case4_prob:
-            # queries are pulled from disk at location self.query_pool
-            queries = self.random_query(img_class, self.case4_sigma)
+        areas = bboxes[:, 2] * bboxes[:, 3]
+        areas = areas / areas.max()
+        samples = min(bboxes.shape[0], self.random_size())
+        if self.query_pool is not None:
+            samples_pool = int(samples * self.prob_pool + 0.5)
+            samples_im = samples - samples_pool
+            query_im = self.sample_query_from_pool(samples_pool, target['obj label'])
         else:
-            # queries are pulled from the target image, and are a subset of bboxes
-            queries, bboxes = self.random_query_bbox(bboxes)
-            queries = [fetch_query(img, q) for q in queries]
-        
-        if self.query_transforms is not None:
-            # pass empty dict as there are no boxes to be transformed
-            queries = [self.query_transforms(q, {})[0] for q in queries]
-        
-        bboxes = torch.as_tensor(bboxes, dtype=torch.float32)
-        # from [x, y, w, h] to [x, y, x1, y1], for transforms
-        bboxes[:, 2] = bboxes[:, 0] + bboxes[:, 2]
-        bboxes[:, 3] = bboxes[:, 1] + bboxes[:, 3]
-
-        # format for transform functions
-        bboxes = {'boxes': bboxes}
-
-        if self.transforms is not None:
-            img, bboxes = self.transforms(img, bboxes)
-        
-        #similarity_score = compute_highest_similarity(queries, img, bboxes['boxes'].numpy())
-        queries = [self.normalize(q, {})[0] for q in queries]
-        img, bboxes = self.normalize(img, bboxes)
-        # img.shape = [C, H, W]; both img, queries and bboxes are normalized
-        return img, queries, bboxes['boxes']#, similarity_score
+            samples_im = samples
+            query_im = []
+        if samples_im > 0:
+            keep = torch.multinomial(areas, samples_im, replacement=False)
+            query = bboxes[keep]
+            query_im.extend(self.fetch_query(img, query))
+        return query_im
     
-    @staticmethod
-    def collate_fn(batch):
-        img = [i[0] for i in batch]
-        query_im = [i[1] for i in batch]
-        #similarity_scores = torch.tensor([[i[3]] for i in batch])
-        target = [{'labels': torch.zeros(b.shape[0], dtype=torch.int64), 'boxes': b} for _, _, b in batch]
-        return img, query_im, target
+    def __call__(self, img, target):
+        self.random_class(target)
+        qrs = self.random_query(img, target)
+        qrs = [self.transforms(qr, {})[0] for qr in qrs]
+        qrs = self.stretch_queries(qrs)
+        # every instance could be of the 'object' category
+        target['labels'] = torch.zeros(target['boxes'].shape[0], dtype=torch.int64)
+        return img, qrs, target
 
 
 def img_transforms(image_set):
@@ -295,7 +205,7 @@ def img_transforms(image_set):
                 T.RandomResize(scales, max_size=672),
                 T.Compose([
                     T.RandomResize([400, 500, 600]),
-                    T.RandomSizeCrop(384, 600),
+                    #T.RandomSizeCrop(384, 600),
                     T.RandomResize(scales, max_size=672),
                 ])
             ),
@@ -303,21 +213,21 @@ def img_transforms(image_set):
 
     if image_set == 'val':
         return T.Compose([
-            T.RandomResize([800], max_size=1333),
+            T.RandomResize([512], max_size=672),
         ])
 
     raise ValueError(f'unknown {image_set}')
 
 
 def query_transforms():
-    scales = [16, 32, 64, 96, 128, 160, 192, 224, 256]
+    scales = [96, 128, 160, 192, 224, 256]
 
     return T.Compose([
         T.RandomHorizontalFlip(),
         T.RandomSelect(
             T.RandomResize(scales, max_size=256),
             T.Compose([
-                T.RandomResize([50, 100, 200], max_size=256),
+                T.RandomResize([64, 100, 200], max_size=256),
                 T.RandomResize(scales, max_size=256),
             ])
         ),
@@ -325,13 +235,32 @@ def query_transforms():
     ])
 
 
-# %%
-def testing():
-    root = "datasets/coco/"
-    data = CocoBoxes(root + 'val2017', root + 'annotations/instances_val2017.json',
-                     query_transforms=query_transforms(), transforms=img_transforms('train'),
-                     query_pool=root + 'val2017_query_pool')
-    print(data.keys)
+def collate_fn(batch):
+    img = [i[0] for i in batch]
+    query_im = [i[1] for i in batch]
+    #similarity_scores = torch.tensor([[i[3]] for i in batch])
+    target = [i[2] for i in batch]
+    return img, query_im, target
 
+
+# TODO decrease similarity as a function of steps/loss? 
 if __name__ == "__main__":
-    testing()
+    from utils.misc import visualize_output
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+    root = "datasets/coco/"
+    proc = 'train'
+    query_process = GetQuery(query_transforms(), 3, 2, stretch_limit=0.8, query_pool=root + proc + "2017_query_pool")
+
+    dataset = CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', img_transforms('train'), query_process)
+
+    #val_set = DataLoader(dataset, 16, True, num_workers=12, collate_fn=collate_fn)
+    #val_set = iter(val_set)
+    #
+    #for im, qrs, tgt in tqdm(val_set):
+    #    pass
+
+    dataset.get_query.prob_pool = 0.3
+    dataset.get_query.min_size = 64
+    im, qrs, tgt = dataset[92]
+    visualize_output(im, qrs, tgt['boxes'])
