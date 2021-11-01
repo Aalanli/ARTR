@@ -107,23 +107,34 @@ class DynamicBlock(nn.Module):
     def __init__(
         self,
         attn,
-        channels,
+        in_channels,
         hidden,
+        out_channels,
+        stride=1,
         norm_layer = None,
     ) -> None:
         super(DynamicBlock, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
-        self.conv1 = conv1x1(channels, hidden)
+        self.conv1 = conv1x1(in_channels, hidden)
         self.bn1 = norm_layer(hidden)
         self.conv2 = DynamicConv2D(attn, hidden, hidden)
         self.bn2 = norm_layer(hidden)
-        self.conv3 = conv3x3(hidden, hidden, 1, 1, 1)
+        self.conv3 = conv3x3(hidden, hidden, stride)
         self.bn3 = norm_layer(hidden)
-        self.conv4 = conv1x1(hidden, channels)
-        self.bn4 = norm_layer(channels)
+        self.conv4 = conv1x1(hidden, out_channels)
+        self.bn4 = norm_layer(out_channels)
         self.relu = nn.ReLU(inplace=True)
+
+        if out_channels != in_channels or stride != 1:
+            self.downsample = nn.Sequential(
+                conv1x1(in_channels, out_channels, stride),
+                norm_layer(out_channels)
+            )
+        else:
+            self.downsample = None
+
 
     def forward(self, x: Tensor, feat: Tensor, mask: Tensor = None, pos: Tensor = None) -> Tensor:
         identity = x
@@ -143,6 +154,9 @@ class DynamicBlock(nn.Module):
         out = self.conv4(out)
         out = self.bn4(out)
 
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        
         out += identity
         out = self.relu(out)
 
@@ -166,16 +180,16 @@ class DynamicResnetLayer(nn.Module):
         self.layer_map = layer_map
         self.layers = nn.ModuleList()
         if layer_map[0] == 1:
-            self.layers.append(DynamicBlock(self.attn, in_channel, hidden, norm_layer=norm_layer))
+            self.layers.append(DynamicBlock(self.attn, in_channel, hidden, hidden * expansion, stride=stride, norm_layer=norm_layer))
         else:
             self.layers.append(Bottleneck(in_channel, hidden, hidden * expansion, stride=stride,
                                           dilation=previous_dilation, norm_layer=norm_layer))
-        for i in layer_map:
+        for i in layer_map[1:]:
             if i == 0:
                 self.layers.append(Bottleneck(hidden * expansion, hidden, hidden * expansion, dilation=dilation, 
                                             norm_layer=norm_layer))
             else:
-                self.layers.append(DynamicBlock(self.attn, hidden * expansion, hidden, norm_layer=norm_layer))
+                self.layers.append(DynamicBlock(self.attn, hidden * expansion, hidden, hidden * expansion, norm_layer=norm_layer))
         
     def forward(self, x, feat_map, mask=None, pos=None):
         for i, b in enumerate(self.layer_map):
@@ -184,7 +198,6 @@ class DynamicResnetLayer(nn.Module):
             else:
                 x = self.layers[i](x, feat_map, mask, pos)
         return x
-
 
 
 class SpatialFeatureExtractor(nn.Module):
@@ -238,12 +251,13 @@ class SpatialFeatureExtractor(nn.Module):
         x = self.relu(x)
         x = self.maxpool(x)
         if masks is None:
-            masks = [None for _ in range(4)]
+            masks = [None] * 4
         if pos is None:
-            pos = [None for _ in range(4)]            
+            pos = [None] * 4
         x = self.layer1(x, feat_maps[0], masks[0], pos[0])
         x = self.layer2(x, feat_maps[1], masks[1], pos[1])
         x = self.layer3(x, feat_maps[2], masks[2], pos[2])
         x = self.layer4(x, feat_maps[3], masks[3], pos[3])
 
         return x
+
