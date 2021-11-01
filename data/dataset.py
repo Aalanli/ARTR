@@ -30,10 +30,13 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
         if self._transforms is not None:
             img, target = self._transforms(img, target)
-        img, qrs, target = self.get_query(img, target)
+        if self.get_query is not None:
+            qrs = self.get_query(img, target)
+            qrs = [self.normalize(qr, {})[0] for qr in qrs]
 
         img, target = self.normalize(img, target)
-        qrs = [self.normalize(qr, {})[0] for qr in qrs]
+        if self.get_query is None:
+            return img, [], target
         return img, qrs, target
 
 
@@ -140,16 +143,19 @@ class GetQuery:
             f = random.randint(0, self.query_instances[str(label)] - 1)
             f = folder_path + '/' + str(f) + '.jpg'
             im = Image.open(f)
-            if self.min_size is None:
+            if self.min_size is None and 0 not in im.size:
                 queries.append(im.convert('RGB'))
                 indx += 1
             elif im.width > self.min_size and im.height > self.min_size:
                 queries.append(im.convert('RGB'))
                 indx += 1
+        assert 0 not in [i for q in queries for i in q.size], "0 sized queries in qrs"
         return queries
         
     def random_query(self, img, target) -> List[Image.Image]:
-        bboxes = target['boxes'].clone()
+        bboxes = target['boxes']
+        assert not (0 == bboxes[:, 2:]).any(), "0 detected in bounding boxes"
+
         # dealing with zero box cases
         if bboxes.shape[0] == 0 and self.query_pool is not None:
             # get a random sample from the query pool
@@ -187,12 +193,14 @@ class GetQuery:
     
     def __call__(self, img, target):
         self.random_class(target)
+        bboxes = target['boxes'].clone()
         qrs = self.random_query(img, target)
         qrs = [self.transforms(qr, {})[0] for qr in qrs]
         qrs = self.stretch_queries(qrs)
         # every instance could be of the 'object' category
+        target['boxes'] = bboxes
         target['labels'] = torch.zeros(target['boxes'].shape[0], dtype=torch.int64)
-        return img, qrs, target
+        return qrs
 
 
 def img_transforms(image_set):
@@ -250,17 +258,9 @@ if __name__ == "__main__":
     from tqdm import tqdm
     root = "datasets/coco/"
     proc = 'train'
-    query_process = GetQuery(query_transforms(), 3, 2, stretch_limit=0.8, query_pool=root + proc + "2017_query_pool")
+    query_process = GetQuery(query_transforms(), 3, 2, stretch_limit=0.7, min_size=32,
+                                    query_pool=root + proc + "2017_query_pool", prob_pool=0.3, max_queries=10)
 
     dataset = CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', img_transforms('train'), query_process)
-
-    #val_set = DataLoader(dataset, 16, True, num_workers=12, collate_fn=collate_fn)
-    #val_set = iter(val_set)
-    #
-    #for im, qrs, tgt in tqdm(val_set):
-    #    pass
-
-    dataset.get_query.prob_pool = 0.3
-    dataset.get_query.min_size = 64
-    im, qrs, tgt = dataset[92]
-    visualize_output(im, qrs, tgt['boxes'])
+    train_set = torch.utils.data.DataLoader(dataset, 16, True, num_workers=12, collate_fn=collate_fn)    
+    
