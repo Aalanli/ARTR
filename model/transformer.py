@@ -1,10 +1,11 @@
 # %%
 import math
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import init
+from torch import Tensor
 from torch.utils import checkpoint
 
 
@@ -94,12 +95,12 @@ class Attention(nn.Module):
         v = self.vw(v)
         return q, k, v
     
-    def forward(self, query, key, value, mask=None, alibi_mask=None):
-        q, k, v = self.attn_proj(query, key, value)
+    def forward(self, q, k, v, mask=None, alibi_mask=None):
+        q, k, v = self.attn_proj(q, k, v)
         q, k, v = map(self.split_heads, (q, k, v))
         out, a = self.multihead_attn(q, k, v, mask, alibi_mask)
         return self.combine_heads(out), a
-
+    
 
 def checkpoint_wrapper(func, *args, apply=True):
     if apply:
@@ -152,7 +153,7 @@ class DecoderLayer(nn.Module):
     def apply_pos(self, x, pos):
         return x if pos is None else x + pos
     
-    def forward(self, x, query, memory, mask_q=None, mask_k=None, alibi_mask=None, pos_q=None, pos_k=None):
+    def forward(self, x, query=None, memory=None, mask_q=None, mask_k=None, alibi_mask=None, pos_q=None, pos_k=None):
         query = self.apply_pos(query, pos_q)
         q = k = self.apply_pos(x, query)
         x1 = self.attn1(q, k, x, mask=mask_q, alibi_mask=alibi_mask)[0]
@@ -171,3 +172,156 @@ class DecoderLayer(nn.Module):
         x = self.norm3(x)
         return x
 
+
+class EncoderLayerV2(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = Attention(d_model, nhead, bias=True, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self,
+                     src,
+                     mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None,
+                     alibi=None):
+        q = k = self.with_pos_embed(src, pos)
+        src2 = self.self_attn(q, k, v=src, mask=mask, alibi_mask=alibi)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+    def forward_pre(self, src,
+                    mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None, 
+                    alibi=None):
+        src2 = self.norm1(src)
+        q = k = self.with_pos_embed(src2, pos)
+        src2 = self.self_attn(q, k, v=src2,
+                              mask=mask, alibi_mask=alibi)[0]
+        src = src + self.dropout1(src2)
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src = src + self.dropout2(src2)
+        return src
+
+    def forward(self, src,
+                mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                alibi_mask=None):
+        if self.normalize_before:
+            return self.forward_pre(src, mask, pos, alibi=alibi_mask)
+        return self.forward_post(src, mask, pos, alibi=alibi_mask)
+
+
+class DecoderLayerV2(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = Attention(d_model, nhead, bias=True, dropout=dropout)
+        self.multihead_attn = Attention(d_model, nhead, bias=True, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, tgt, memory,
+                     tgt_key_padding_mask: Optional[Tensor] = None,
+                     memory_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None,
+                     query_pos: Optional[Tensor] = None,
+                     alibi=None):
+        # tgt = 0, memory = encoder output, memory_key_padding_mask = mask, pos = positional_embedding, query_pos = selected query embeddings
+        q = k = self.with_pos_embed(tgt, query_pos)  # q = k = query embeddings
+        tgt2 = self.self_attn(q, k, tgt,
+                              mask=tgt_key_padding_mask, alibi_mask=alibi)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        tgt2 = self.multihead_attn(q=self.with_pos_embed(tgt, query_pos),
+                                   k=self.with_pos_embed(memory, pos),
+                                   v=memory,
+                                   mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+    def forward_pre(self, tgt, memory,
+                    tgt_key_padding_mask: Optional[Tensor] = None,
+                    memory_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None,
+                    query_pos: Optional[Tensor] = None,
+                    alibi=None):
+        tgt2 = self.norm1(tgt)
+        q = k = self.with_pos_embed(tgt2, query_pos)
+        tgt2 = self.self_attn(q, k, tgt2,
+                              mask=tgt_key_padding_mask, alibi_mask=alibi)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.multihead_attn(q=self.with_pos_embed(tgt2, query_pos),
+                                   k=self.with_pos_embed(memory, pos),
+                                   v=memory,
+                                   mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
+        return tgt
+
+    def forward(self, tgt, memory,
+                mask_q: Optional[Tensor] = None,
+                mask_k: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None,
+                alibi_mask=None):
+        if self.normalize_before:
+            return self.forward_pre(tgt, memory,
+                                    mask_q, mask_k, pos, query_pos, alibi=alibi_mask)
+        return self.forward_post(tgt, memory,
+                                 mask_q, mask_k, pos, query_pos, alibi=alibi_mask)
+
+
+def _get_activation_fn(activation):
+    """Return an activation function given a string"""
+    if type(activation) != str:
+        return activation
+    if activation == "relu":
+        return F.relu
+    if activation == "gelu":
+        return F.gelu
+    if activation == "glu":
+        return F.glu
+    raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
