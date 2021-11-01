@@ -154,6 +154,7 @@ class TrainerWandb(Trainer):
         mixed_precision: bool = None,
         lr_scheduler: bool = None,
         max_checkpoints: int = None,
+        max_norm=0.1,
         config=None) -> None:
 
         self.model = model
@@ -165,6 +166,7 @@ class TrainerWandb(Trainer):
         self.metric_step = metric_step
         self.checkpoint_step = checkpoint_step
         self.log_results_step = log_results_step
+        self.max_norm = max_norm
         self.config = config
 
         self.max_checkpoints_saved = max_checkpoints
@@ -210,6 +212,8 @@ class TrainerWandb(Trainer):
         self.steps += 1
         self.optimizer.zero_grad()
         self.scaler.scale(losses).backward()
+        if self.max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
@@ -261,11 +265,11 @@ class TrainerWandb(Trainer):
     
     def log_detection(self, ims, qrs, model_out, prefix, target=None):
         # only log the first example in the batch
-        bboxes = model_out['pred_boxes'][0]
-        probs = model_out['pred_logits'][0].softmax(-1)
+        bboxes = model_out['pred_boxes'][0].to(torch.float32)
+        probs = model_out['pred_logits'][0].to(torch.float32).softmax(-1)
         class_id = probs.argmax(-1)
         ims, bboxes = self.im_unnormalizer(ims[0], bboxes)
-        qrs_ex = self.im_unnormalizer(qrs[0][0])[0]
+        #qrs_ex = self.im_unnormalizer(qrs[0][0])[0]
 
         all_boxes = []
         if target is not None:
@@ -298,8 +302,8 @@ class TrainerWandb(Trainer):
             all_boxes.append(box_data)
     
         images = wandb.Image(ims, caption='target image', boxes={'predictions': {'box_data': all_boxes, 'class_labels': self.ids}})
-        queries = wandb.Image(qrs_ex, caption='image query example')
-        wandb.log({f'images_{prefix}/target': images, f'images_{prefix}/queries': queries}, step=self.steps)
+        #queries = wandb.Image(qrs_ex, caption='image query example')
+        wandb.log({f'images_{prefix}/target': images, }, step=self.steps) # f'images_{prefix}/queries': queries
 
 
     def train(self, train_data, eval_data=None):

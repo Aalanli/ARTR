@@ -40,7 +40,7 @@ def model_builder(artr: Module, transformer: Module, backbone: Module, args):
 
 def build_loss(HungarianMatcher: Module, SetCriterion: Module, args):
     matcher = HungarianMatcher(args.cost_class, args.cost_bbox, args.cost_giou)
-    return SetCriterion(1, matcher, args.cost_eof, args.losses).cuda()
+    return SetCriterion(91, matcher, args.cost_eof, args.losses).cuda()
 
 
 def increment_folder(root_dir):
@@ -82,8 +82,8 @@ def run_sweep(objects: List[dict], args_list: list, epochs, root_dir, data_dir, 
         query_process = data.GetQuery(data.query_transforms(), args.query_mu, args.query_std, stretch_limit=args.query_stretch_limit, min_size=args.min_query_dim,
                                       query_pool=root + proc + "2017_query_pool", prob_pool=args.query_pool_prob, max_queries=args.max_queries)
 
-        dataset = data.CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', data.img_transforms('train'), query_process)
-        train_set = torch.utils.data.DataLoader(dataset, args.batch_size, True, num_workers=8, collate_fn=data.collate_fn)        
+        dataset = data.CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', data.img_transforms('train'), None)
+        train_set = torch.utils.data.DataLoader(dataset, args.batch_size, shuffle=True, num_workers=8, collate_fn=data.collate_fn)        
         trainer.train_epochs(epochs, train_set)
 
         del model, criterion, param_dicts, optimizer, lr_scheduler, train_set, trainer
@@ -102,9 +102,22 @@ def run_test_sweep(objects: List[dict], args_list: list):
         ims = misc.gen_test_data(512, 64, 4)
         qrs = [misc.gen_test_data(256, 64, 2) for i in range(4)]
 
-        try:
-            a = model(ims, qrs)
-            print(args.name, "passed with no errors")
-            print("output shape: ", a.shape)
-        except Exception as e:
-            print(e)
+        a = model(ims, qrs)
+        print(args.name, "passed with no errors")
+        print({f"output shape: {k}": v.shape for k, v in a.items()})
+
+        l = sum([a[k].sum() for k in a])
+        l.sum().backward()
+
+        grad_parameters = 0
+        for n, i in model.named_parameters():
+            if i.grad is None:
+                print(n, "parameter is None")
+            else:
+                s = 1
+                for h in i.grad.shape: s *= h
+                grad_parameters += s
+        print("grad parameters", grad_parameters)
+    return model
+
+

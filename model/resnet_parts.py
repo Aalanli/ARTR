@@ -12,7 +12,7 @@ import torchvision
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
-
+import torchvision.models.resnet
 
 class FrozenBatchNorm2d(torch.nn.Module):
     """
