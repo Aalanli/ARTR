@@ -3,6 +3,7 @@ from typing import Any, Union, Optional, Callable, List
 
 from torch import nn
 from torch import Tensor
+import torch
 
 from torchvision.models.resnet import ResNet, BasicBlock, Bottleneck, load_state_dict_from_url, model_urls
 
@@ -49,7 +50,7 @@ class QueryResnet(ResNet):
         self.downsample3 = nn.AvgPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2))
         self.conv3d_4 = DepthWiseConv3D(512, 512)
         self.downsample4 = nn.AvgPool3d(kernel_size=(1, 3, 3), stride=(1, 1, 1))
-
+        self.feature_dims = [64, 128, 256, 512]
     
     def flatten(self, x):
         B, N, C, X1, X2 = x.shape
@@ -59,36 +60,36 @@ class QueryResnet(ResNet):
         BN, C, X1, X2 = x.shape
         return x.reshape(B, N, C, X1, X2)
     
-    def _forward_impl(self, x: Tensor) -> Tensor:
+    def _forward_impl(self, x: Tensor) -> List[Tensor]:
         x, (B, N) = self.flatten(x)
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
 
-        outputs = {}
+        outputs = []
         x = self.layer1(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_1(x)        
-        outputs[64] = self.downsample1(x)
+        outputs.append(self.downsample1(x))
 
         x, (B, N) = self.flatten(x.transpose(2, 1))
         x = self.layer2(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_2(x)        
-        outputs[128] = self.downsample2(x)
+        outputs.append(self.downsample2(x))
 
         x, (B, N) = self.flatten(x.transpose(2, 1))
         x = self.layer3(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_3(x)
-        outputs[256] = self.downsample3(x)
+        outputs.append(self.downsample3(x))
 
         x, (B, N) = self.flatten(x.transpose(2, 1))
         x = self.layer4(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_4(x)
-        outputs[512] = self.downsample4(x)
+        outputs.append(self.downsample4(x))
 
         return outputs
 
@@ -124,16 +125,15 @@ class QueryBackbone(nn.Module):
         super().__init__()
         self.resnet = resnet34(pretrained)
     
-    def forward(self, x: List[List[Tensor]]):
-        features = {}
+    def forward(self, x: List[List[Tensor]]) -> List[Tensor]:
+        features = [[] for i in range(4)]
+
         for sample in x:
             # qim.shape = [N, 3, X1, X2]
             qim = make_equal_3D(sample)
             qr = self.resnet(qim.unsqueeze(0))
-            for k, t in qr.items():
-                if k not in features:
-                    features[k] = []
-                features[k].append(t.squeeze(0).flatten(1))
-        for k in features:
+            for i in range(4):
+                features[i].append(qr[i].squeeze(0).flatten(1))
+        for k in range(4):
             features[k] = make_equal(*features[k])
         return features
