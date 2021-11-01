@@ -67,17 +67,24 @@ class FixedPositionalEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.inv_freq = 1. / (10000 ** (torch.arange(0, self.dim, 2).float() / self.dim))
-        self.seq_len = 0
-    
-    def calculate(self):
-        position = torch.arange(0, self.seq_len, dtype=torch.float)
-        sinusoid_inp = torch.einsum("i,j->ij", position, self.inv_freq)
-        emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
-        self.register_buffer('emb', emb)
+        # the amount to increment after exceeding current seq_len
+        self.seg_div = 256
 
+        self.cur_seq_len = 256
+        self.emb = None
+    
+    def get_seg(self, new_len):
+        return math.ceil(new_len / self.seg_div) * self.seg_div
+    
+    def calculate(self, length):
+        position = torch.arange(0, length, dtype=torch.float)
+        sinusoid_inp = torch.einsum("i,j->ij", position, self.inv_freq)
+        return torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
+    
     def forward(self, x):
         seq_len = x.shape[1]
-        if seq_len > self.seq_len:
-            self.seq_len = seq_len
-            self.calculate()
-        return self.emb[None, :seq_len, :].to(x)
+        if self.emb is None or seq_len > self.cur_seq_len or x.device != self.emb.device:
+            self.cur_seq_len = self.get_seg(seq_len)
+            self.emb = self.calculate(self.cur_seq_len).to(x)
+            self.emb.unsqueeze_(0)
+        return self.emb[:, :seq_len, :]
