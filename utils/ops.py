@@ -161,6 +161,23 @@ def nested_tensor_from_tensor_list(tensor_list, mask_list=None, exclude_mask_dim
     return tensor, mask
 
 
+def make_equal_3D(tensor_list: List[torch.Tensor]):
+    # TODO make this more general
+    if tensor_list[0].ndim == 3:
+        # TODO make it support different-sized images
+        max_size = max_by_axis([list(img.shape) for img in tensor_list])
+        # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
+        batch_shape = [len(tensor_list)] + max_size
+        dtype = tensor_list[0].dtype
+        device = tensor_list[0].device
+        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+        for img, pad_img in zip(tensor_list, tensor):
+            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+    else:
+        raise ValueError('not supported')
+    return tensor
+
+
 def l2_query_distance_(image: torch.Tensor, query, bbox: torch.Tensor):
     dist = torch.tensor(0.0)
     h, w = image.shape[-2:]
