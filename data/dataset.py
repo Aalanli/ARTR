@@ -155,7 +155,7 @@ class GetQuery:
     def random_query(self, img, target) -> List[Image.Image]:
         bboxes = target['boxes']
         assert not (0 == bboxes[:, 2:]).any(), "0 detected in bounding boxes"
-
+        assert (bboxes[:, 2:] >= bboxes[:, :2]).all(), "bbox error in getQuery"
         # dealing with zero box cases
         if bboxes.shape[0] == 0 and self.query_pool is not None:
             # get a random sample from the query pool
@@ -170,9 +170,9 @@ class GetQuery:
         if self.min_size is not None:
             keep = (bboxes[:, 2] > self.min_size).logical_and(bboxes[:, 3] > self.min_size)
             # size could be zero, filter by or instead
-            if not keep.any():
+            if keep.any() == False:
                 keep = (bboxes[:, 2] > self.min_size).logical_or(bboxes[:, 3] > self.min_size)
-            if keep.any():
+            if keep.any() == True:
                 bboxes = bboxes[keep]
         
         areas = bboxes[:, 2] * bboxes[:, 3]
@@ -182,6 +182,7 @@ class GetQuery:
             samples_pool = int(samples * self.prob_pool + 0.5)
             samples_im = samples - samples_pool
             query_im = self.sample_query_from_pool(samples_pool, target['obj label'])
+            for i in query_im: self.assert_not_zero(i, 'zero sized image before.')
         else:
             samples_im = samples
             query_im = []
@@ -189,7 +190,12 @@ class GetQuery:
             keep = torch.multinomial(areas, samples_im, replacement=False)
             query = bboxes[keep]
             query_im.extend(self.fetch_query(img, query))
+
+        for i in query_im: self.assert_not_zero(i, 'zero sized image after.')
         return query_im
+    
+    def assert_not_zero(self, im, message):
+        assert 0 not in im.size, message
     
     def __call__(self, img, target):
         self.random_class(target)
@@ -252,15 +258,24 @@ def collate_fn(batch):
 
 
 # TODO decrease similarity as a function of steps/loss? 
-if __name__ == "__main__":
+
+def test():
     from utils.misc import visualize_output
     from torch.utils.data import DataLoader
     from tqdm import tqdm
+    import utils.ops as ops
     root = "datasets/coco/"
     proc = 'train'
     query_process = GetQuery(query_transforms(), 3, 2, stretch_limit=0.7, min_size=32,
                                     query_pool=root + proc + "2017_query_pool", prob_pool=0.3, max_queries=10)
 
     dataset = CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', img_transforms('train'), query_process)
-    train_set = torch.utils.data.DataLoader(dataset, 16, True, num_workers=12, collate_fn=collate_fn)    
+    train_set = torch.utils.data.DataLoader(dataset, 16, True, num_workers=12, collate_fn=collate_fn)
     
+    for (ims, qrs, tgt) in tqdm((iter(train_set))):
+        for t in tgt:
+            boxes1 = ops.box_cxcywh_to_xyxy(t['boxes'])
+            assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+
+if __name__ == "__main__":
+    test()

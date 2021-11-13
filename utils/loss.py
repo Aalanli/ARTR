@@ -158,7 +158,7 @@ class SetCriterion(nn.Module):
 
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
+        assert torch.isnan(src_boxes).any() == False, 'src_boxes have nan results'
         loss_giou = 1 - torch.diag(ops.generalized_box_iou(
             ops.box_cxcywh_to_xyxy(src_boxes),
             ops.box_cxcywh_to_xyxy(target_boxes)))

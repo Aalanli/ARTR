@@ -33,7 +33,7 @@ class DynamicConv2D(nn.Module):
         w = w.transpose(-1, -2).reshape(batch * self.in_channels, 1, self.kernel_size, self.kernel_size)
         x = x.view(1, batch * c, x1, y1)
         x = F.conv2d(x, w, self.bias, self.stride, self.padding, groups=batch * self.in_channels)
-        x = x.view(batch, c, x1, y1)
+        x = x.view(batch, c, x.shape[2], x.shape[3])
         return self.conv(x)
 
 
@@ -119,9 +119,9 @@ class DynamicBlock(nn.Module):
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv1x1(in_channels, hidden)
         self.bn1 = norm_layer(hidden)
-        self.conv2 = DynamicConv2D(attn, hidden, hidden)
+        self.conv2 = DynamicConv2D(attn, hidden, hidden, stride=stride)
         self.bn2 = norm_layer(hidden)
-        self.conv3 = conv3x3(hidden, hidden, stride)
+        self.conv3 = conv3x3(hidden, hidden, 1)
         self.bn3 = norm_layer(hidden)
         self.conv4 = conv1x1(hidden, out_channels)
         self.bn4 = norm_layer(out_channels)
@@ -138,12 +138,15 @@ class DynamicBlock(nn.Module):
 
     def forward(self, x: Tensor, feat: Tensor, mask: Tensor = None, pos: Tensor = None) -> Tensor:
         identity = x
+        assert torch.isnan(feat).any() == False, 'features with nan features'
 
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
         
         out = self.conv2(out, feat, mask, pos)
+        assert torch.isnan(out).any() == False, 'dynamic_conv2d with nan features'
+
         out = self.bn2(out)
         out = self.relu(out)
 
@@ -164,6 +167,13 @@ class DynamicBlock(nn.Module):
 
 
 class DynamicResnetLayer(nn.Module):
+    """
+    A stage in the SpatialFeatureExtractor, where feature maps are computed
+    at dimension hidden and expanded expansion * hidden.
+
+    Each stage shares one transformer decoder, where decodes a feature map of dimension
+    hidden across all DynamicBlocks
+    """
     def __init__(self, layer_map, in_channel, hidden, expansion=4,
                  stride=1, transformer_kwargs=None, dilation=1, norm_layer=None):
         super().__init__()
@@ -201,6 +211,13 @@ class DynamicResnetLayer(nn.Module):
 
 
 class SpatialFeatureExtractor(nn.Module):
+    """
+    SpatialFeatureExtractor takes in a list of feature maps and an image,
+    using the feature maps to compute dynamic convolution kernels which is applied to the image.
+
+    where x.shape = [batch, 3, x, y]
+    [f.shape for f in feat_maps] = [[batch, x1 * y1, 64], [batch, x2 * y2, 128], [batch, x3 * y3, 256], [batch, x4 * y4, 512]]
+    """
     def __init__(
         self,
         layer_maps: List[List[int]],
@@ -209,6 +226,16 @@ class SpatialFeatureExtractor(nn.Module):
         norm_layer = None,
         zero_init_residual=False
     ) -> None:
+        """
+        Args:
+        layer_maps: A 2D list of len 4, where each sublist is a sequence of 0 or 1s, specifying
+                    if the convolution kernel for that layer dynamic or static
+        
+        transformer_kwargs: A dict specifying the arguments for each transformer decoder layer,
+                            if set to none, defaults to {'nhead': 8, 'dim_feedforward': 1024, 
+                                                         'dropout': 0.1, 'activation': 'relu', 
+                                                         'normalize_before': False}
+        """
         super(SpatialFeatureExtractor, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d

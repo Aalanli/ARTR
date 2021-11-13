@@ -42,14 +42,10 @@ class QueryResnet(ResNet):
             norm_layer=norm_layer)
         
         del self.avgpool, self.fc
-        self.conv3d_1 = DepthWiseConv3D(64, 64)
-        self.downsample1 = nn.AvgPool3d(kernel_size=(1, 7, 7), stride=(1, 4, 4))
-        self.conv3d_2 = DepthWiseConv3D(128, 128)
-        self.downsample2 = nn.AvgPool3d(kernel_size=(1, 5, 5), stride=(1, 3, 3))
-        self.conv3d_3 = DepthWiseConv3D(256, 256)
-        self.downsample3 = nn.AvgPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2))
-        self.conv3d_4 = DepthWiseConv3D(512, 512)
-        self.downsample4 = nn.AvgPool3d(kernel_size=(1, 3, 3), stride=(1, 1, 1))
+        self.conv3d_1 = nn.Identity() #DepthWiseConv3D(64, 64)
+        self.conv3d_2 = nn.Identity() #DepthWiseConv3D(128, 128)
+        self.conv3d_3 = nn.Identity() #DepthWiseConv3D(256, 256)
+        self.conv3d_4 = nn.Identity() #DepthWiseConv3D(512, 512)
         self.feature_dims = [64, 128, 256, 512]
     
     def flatten(self, x):
@@ -71,25 +67,25 @@ class QueryResnet(ResNet):
         x = self.layer1(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_1(x)        
-        outputs.append(self.downsample1(x))
+        outputs.append(x)
 
         x, (B, N) = self.flatten(x.transpose(2, 1))
         x = self.layer2(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_2(x)        
-        outputs.append(self.downsample2(x))
+        outputs.append(x)
 
         x, (B, N) = self.flatten(x.transpose(2, 1))
         x = self.layer3(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_3(x)
-        outputs.append(self.downsample3(x))
+        outputs.append(x)
 
         x, (B, N) = self.flatten(x.transpose(2, 1))
         x = self.layer4(x)
         x = self.inflate(x, B, N).transpose(2, 1)
         x = self.conv3d_4(x)
-        outputs.append(self.downsample4(x))
+        outputs.append(x)
 
         return outputs
 
@@ -121,9 +117,14 @@ def resnet34(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> 
 
 
 class QueryBackbone(nn.Module):
-    def __init__(self, pretrained=False):
+    def __init__(self, arch='resnet34', pretrained=False):
         super().__init__()
-        self.resnet = resnet34(pretrained)
+        if arch == 'resnet34':
+            self.resnet = resnet34(pretrained)
+        elif arch == 'resnet18':
+            self.resnet = resnet18(pretrained)
+        else:
+            raise NameError(f'architecture {arch} not in supported choices [resnet34, resnet18]')
     
     def forward(self, x: List[List[Tensor]]) -> List[Tensor]:
         features = [[] for i in range(4)]
@@ -136,4 +137,11 @@ class QueryBackbone(nn.Module):
                 features[i].append(qr[i].squeeze(0).flatten(1))
         for k in range(4):
             features[k] = make_equal(*features[k])
+
         return features
+
+"""# %%
+res = resnet34()
+a = torch.rand(4, 1, 3, 256, 256)
+print([i.shape for i in res(a)])"""
+
