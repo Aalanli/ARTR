@@ -5,6 +5,7 @@ import random
 from typing import List
 
 import torch
+from torch.utils import data
 import torchvision
 import torchvision.transforms.functional as F
 from PIL import Image
@@ -13,25 +14,76 @@ import numpy as np
 import data.transforms as T
 
 
-class CocoDetection(torchvision.datasets.CocoDetection):
-    def __init__(self, img_folder, ann_file, transforms, get_query):
-        super(CocoDetection, self).__init__(img_folder, ann_file)
+class CocoDetection:
+    def __init__(self, img_folder, ann_file, transforms, get_query, fix_label=None):
+        print("loading annotations.")
+        with open(ann_file, "r") as f:
+            annotations = json.load(f)['annotations']
+        by_file = {}
+        for n in annotations:
+            if n['image_id'] not in by_file:
+                by_file[n['image_id']] = {'bbox': [n['bbox']], 'labels': [n['category_id']]}
+            else:
+                by_file[n['image_id']]['bbox'].append(n['bbox'])
+                by_file[n['image_id']]['labels'].append(n['category_id'])
+        self.annotations_ = by_file
+        for id in self.annotations_:
+            self.annotations_[id]['bbox'] = np.asarray(self.annotations_[id]['bbox'])
+            self.annotations_[id]['labels'] = np.asarray(self.annotations_[id]['labels'])
+        
+        if fix_label is not None:
+            self.update_label_restriction(fix_label)
+        else:
+            self.annotations = self.annotations_
+        
+        self.id_list = list(self.annotations.keys())
+        self.img_folder = img_folder
         self._transforms = transforms
         self.prepare = VectorizeData()
         self.get_query = get_query
         self.normalize = T.Compose([T.ToTensor(),
                                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        self.fix_label = fix_label
+    
+    def filter_by_label(self, label, annotations):
+        filtered = {}
+        for id in annotations:
+            mask = annotations[id]['labels'] == label
+            if mask.any():
+                filtered[id] = {}
+                filtered[id]['labels'] = np.zeros_like(annotations[id]['labels'][mask], dtype=np.float64)
+                filtered[id]['bbox'] = annotations[id]['bbox'][mask]
+        return filtered
+    
+    def update_label_restriction(self, label: int):
+        self.annotations = self.filter_by_label(label, self.annotations_)
+    
+    def get_img_path(self, id: int):
+        base = "000000000000"
+        id = str(id)
+        path = os.path.join(self.img_folder, base[:12-len(id)] + id + ".jpg")
+        return path
+    
+    def get_img_target(self, idx):
+        id = self.id_list[idx]
+        img_path = self.get_img_path(id)
+        pil_img = Image.open(img_path).convert("RGB")
+        targets = self.annotations[id]
+        return pil_img, targets
+    
+    def __len__(self):
+        return len(self.id_list)
+
     def __getitem__(self, idx):
         """target['boxes'] = [x, y, x1, y1] top left corner, bottom right corner"""
-        img, target = super(CocoDetection, self).__getitem__(idx)
-        image_id = self.ids[idx]
-        target = {'image_id': image_id, 'annotations': target}
+        img, target = self.get_img_target(idx)
         img, target = self.prepare(img, target)
 
         if self._transforms is not None:
             img, target = self._transforms(img, target)
         if self.get_query is not None:
             qrs = self.get_query(img, target)
+            qrs = [self._transforms(qr, {})[0] for qr in qrs]
             qrs = [self.normalize(qr, {})[0] for qr in qrs]
 
         img, target = self.normalize(img, target)
@@ -45,51 +97,61 @@ class VectorizeData:
     def __call__(self, image, target):
         w, h = image.size
 
-        anno = target["annotations"]
-
-        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
-
-        boxes = [obj["bbox"] for obj in anno]
+        boxes = target['bbox']
         # guard against no boxes via resizing
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        if (boxes[:, 2:] == 0).any():
+            # prevent zero width queries
+            boxes[:, 2:] += 1 
         boxes[:, 2:] += boxes[:, :2]
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        classes = [obj["category_id"] for obj in anno]
+        classes = target['labels']
         classes = torch.tensor(classes, dtype=torch.int64)
-
-        keypoints = None
-        if anno and "keypoints" in anno[0]:
-            keypoints = [obj["keypoints"] for obj in anno]
-            keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
-            num_keypoints = keypoints.shape[0]
-            if num_keypoints:
-                keypoints = keypoints.view(num_keypoints, -1, 3)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         classes = classes[keep]
 
-        if keypoints is not None:
-            keypoints = keypoints[keep]
-
         target = {}
         target["boxes"] = boxes
         target["labels"] = classes
-        if keypoints is not None:
-            target["keypoints"] = keypoints
-
-        # for conversion to coco api
-        iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
-        target["iscrowd"] = iscrowd[keep]
 
         target["orig_size"] = torch.as_tensor([int(h), int(w)])
         target["size"] = torch.as_tensor([int(h), int(w)])
 
         return image, target
+# %%
+class SingleQuery:
+    def __init__(self, min_qr_area=32**2) -> None:
+        self.min_area = min_qr_area
+    
+    def fetch_query(self, im, boxes) -> List[Image.Image]:
+        box = boxes.tolist()
+        return [F.crop(im, b[1], b[0], max(b[3] - b[1], 1), max(b[2] - b[0], 0)) for b in box]
 
+    def __call__(self, img, target):
+        boxes = target['boxes']
+        areas = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])  # areas.shape = [batch]
+        keep = areas >= self.min_area
+        if keep.any():  # if there are any that is greater than target area, then removes ones that are lesser
+            areas *= keep.float()
+        # else, keep everything, to avoid empty tensor
+        scaled_areas = (areas - areas.min() + 1)
+        qr_ind = torch.multinomial(scaled_areas, 1)
+        boxes = boxes[qr_ind]
+        qr = self.fetch_query(img, boxes)
 
+        label = target['labels'][qr_ind][0]
+        match_qr = target['labels'] == label
+        target['boxes'] = target['boxes'][match_qr]
+        target['labels'] = torch.zeros([target['boxes'].shape[0]], dtype=torch.int64)
+
+        #target['boxes'] = boxes
+        return qr
+
+# %%
 class GetQuery:
     def __init__(self, transforms, mean_amount, std_amount, min_size=None, stretch_limit=0.3, query_pool=None, max_queries=10, prob_pool=0.1) -> None:
         self.transforms = transforms
@@ -201,7 +263,7 @@ class GetQuery:
         self.random_class(target)
         bboxes = target['boxes'].clone()
         qrs = self.random_query(img, target)
-        qrs = [self.transforms(qr, {})[0] for qr in qrs]
+        #qrs = [self.transforms(qr, {})[0] for qr in qrs]
         qrs = self.stretch_queries(qrs)
         # every instance could be of the 'object' category
         target['boxes'] = bboxes
@@ -259,23 +321,24 @@ def collate_fn(batch):
 
 # TODO decrease similarity as a function of steps/loss? 
 
-def test():
+if __name__ == "__main__":
     from utils.misc import visualize_output
     from torch.utils.data import DataLoader
     from tqdm import tqdm
     import utils.ops as ops
     root = "datasets/coco/"
     proc = 'train'
-    query_process = GetQuery(query_transforms(), 3, 2, stretch_limit=0.7, min_size=32,
-                                    query_pool=root + proc + "2017_query_pool", prob_pool=0.3, max_queries=10)
-
-    dataset = CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', img_transforms('train'), query_process)
-    train_set = torch.utils.data.DataLoader(dataset, 16, True, num_workers=12, collate_fn=collate_fn)
-    
-    for (ims, qrs, tgt) in tqdm((iter(train_set))):
-        for t in tgt:
-            boxes1 = ops.box_cxcywh_to_xyxy(t['boxes'])
-            assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
-
-if __name__ == "__main__":
-    test()
+    #query_process = GetQuery(query_transforms(), 3, 2, stretch_limit=0.7, min_size=32,
+    #                                query_pool=root + proc + "2017_query_pool", prob_pool=0.3, max_queries=10)
+    query_process = SingleQuery()
+    dataset = CocoDetection(root + proc + '2017', root + f'annotations/instances_{proc}2017.json', img_transforms('train'), query_process, None)
+    train_set = torch.utils.data.DataLoader(dataset, 2, True, num_workers=1, collate_fn=collate_fn)
+# %%
+    a, b, c = next(iter(train_set))
+    print(c[0]['boxes'], c[0]['labels'])
+    visualize_output(a[0], b[0], c[0]['boxes'])
+    #print(c)
+    #for (ims, qrs, tgt) in tqdm((iter(train_set))):
+    #    for t in tgt:
+    #        boxes1 = ops.box_cxcywh_to_xyxy(t['boxes'])
+    #        assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
