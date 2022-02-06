@@ -3,15 +3,17 @@ import sys
 import copy
 sys.path[0] = '/home/allan/Programs/ARTR'
 
-from model.training.sweep import run_sweep, run_test_sweep
+from model.training.sweep import run_sweep, run_test_sweep, train_epoch
 from model.modelV2.ARTR import ARTR
+from model.modelV3.conv import Detector
 from utils.misc import EasyDict
 
 def get_parameters():
     args = EasyDict()
 
     args.batch_size = 4
-    args.mixed_precision = False
+    args.mixed_precision = True
+    args.fix_label = None
 
     args.query_pool_prob = 0.4
     args.query_std = 2
@@ -21,8 +23,8 @@ def get_parameters():
     args.max_queries = 10
 
     args.cost_class = 1
-    args.cost_bbox = 5 * 4
-    args.cost_giou = 2 * 4
+    args.cost_bbox = 5
+    args.cost_giou = 2
     args.cost_eof = 0.05
     args.losses = ['boxes', 'labels', 'cardinality']
 
@@ -30,7 +32,7 @@ def get_parameters():
     args.weight_decay = 1e-4
     args.lr_drop = 200
     args.weight_dict = {'loss_giou': 2, 'loss_bbox': 5, 'loss_ce': 1}
-    args.name = 'V2Variant_v3'
+    args.name = 'modelV3_v7'
     return args
 
 def get_model_parameters():
@@ -50,18 +52,35 @@ def get_model_parameters():
     args.normalize_before=False
     return args
 
+def get_model_v3_parameters():
+    args = EasyDict()
+    args.dims = 256
+    args.final_dim = 256
+    args.depths = [5, 5, 5, 5]
+    args.out_sizes = [15, 9, 8, 7]
+    args.kernel_sizes = [7, 5, 4, 4]
+    args.patch_sizes = [7, 5, 3, 3]
+    args.mlp_depth = 5
+    args.queries = 50
+    args.attn_out_channels = 256
+    args.attn_kernel_size = 1
+    args.classes = 97
+    return args
+
 
 def model_generator(param_list):
     for p, p1 in param_list:
-        model = ARTR(**p)
+        model = Detector(**p)
         p = copy.deepcopy(p)
         p.update(p1)
         yield model, p
 
-param_list = [[get_model_parameters(), get_parameters()]]
-model = run_test_sweep(model_generator(param_list))
+param_list = [[get_model_v3_parameters(), get_parameters()]]
+_ = run_test_sweep(model_generator(param_list))
 
 # %%
-run_sweep(model_generator(param_list), epochs=1, root_dir='experiments/artr', data_dir='datasets/coco', metric_step=1200, checkpoint_step=2000,
-          results_step=21000)
+model, args = next(model_generator(param_list))
+model = train_epoch(model, args, epochs=10, root_dir='experiments/artr', data_dir='datasets/coco', metric_step=1200, checkpoint_step=2000,
+                    results_step=21000)
 
+# %%

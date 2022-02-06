@@ -51,12 +51,13 @@ class Trainer:
             else:
                 # first time loading model
                 os.makedirs(self.dir)
-                with open(self.dir + '/model_params.pkl', 'rw') as f:
-                    dill.dump(config, f)
-                # save a pickled referance of the objects
-                # in case original class and arguments were forgotten
-                with open(os.path.join(self.dir, 'obj_ref.pkl'), 'wb') as f:
-                    dill.dump(self.obj_ref, f)
+            with open(self.dir + '/model_params.pkl', 'rw') as f:
+                dill.dump(config, f)
+            # save a pickled referance of the objects
+            # in case original class and arguments were forgotten
+            with open(os.path.join(self.dir, 'obj_ref.pkl'), 'wb') as f:
+                dill.dump(self.obj_ref, f)
+                
         elif isinstance(self.model, str):
             # if model is a string to the model directory
             self.restore_objects(os.path.join(self.model, 'obj_ref.pkl'))
@@ -174,13 +175,6 @@ class TrainerWandb(Trainer):
 
         self.checkpointable = ['model', 'criterion', 'optimizer', 'scaler', 'steps']
         
-        self.id = self.config.name
-        self.loss_weight_dict = self.config.weight_dict
-        self.im_unnormalizer = UnNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-
-        self.labels = {'real': 0, 'eos': 1, 'true': 2}
-        self.ids = {v: k for k, v in self.labels.items()}
-        
         self.scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision)
 
         if isinstance(self.model, torch.nn.Module):    
@@ -189,12 +183,18 @@ class TrainerWandb(Trainer):
             else:
                 # first time loading model
                 os.makedirs(self.dir)
-                with open(self.dir + '/model_params.pkl', 'wb') as f:
-                    dill.dump(config, f)
-                # save a pickled referance of the objects
-                # in case original class and arguments were forgotten
-                with open(os.path.join(self.dir, 'obj_ref.pkl'), 'wb') as f:
-                    dill.dump(self.obj_ref, f)
+            with open(self.dir + '/model_params.pkl', 'wb') as f:
+                dill.dump(config, f)
+            # save a pickled referance of the objects
+            # in case original class and arguments were forgotten
+            with open(os.path.join(self.dir, 'obj_ref.pkl'), 'wb') as f:
+                dill.dump(self.obj_ref, f)
+            self.id = self.config.name
+            self.loss_weight_dict = self.config.weight_dict
+            self.im_unnormalizer = UnNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+            self.labels = {'real': 0, 'eos': 1, 'true': 2}
+            self.ids = {v: k for k, v in self.labels.items()}
         elif isinstance(self.model, str):
             # if model is a string to the model directory
             self.restore_objects(os.path.join(self.model, 'obj_ref.pkl'))

@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.models.layers import DropPath, drop, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
 
 from einops import rearrange
@@ -96,7 +96,7 @@ class ConvRelPosEnc(nn.Module):
         B, h, N, Ch = q.shape
         H, W = size
         assert N == 1 + H * W
-
+        # TODO fix shape errors for decoder attn
         # Convolutional relative position encoding.
         q_img = q[:,:,1:,:]                                                              # Shape: [B, h, H*W, Ch].
         v_img = v[:,:,1:,:]                                                              # Shape: [B, h, H*W, Ch].
@@ -164,20 +164,27 @@ class FactorDecAtt_ConvRelPosEnc(nn.Module):
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)                                           # Note: attn_drop is actually not used.
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
         # Shared convolutional relative position encoding.
-        self.crpe = shared_crpe
+        if shared_crpe is not None:
+            self.crpe = shared_crpe
+        else:
+            self.crpe = nn.Identity()
 
     def forward(self, x, qr, size):
         B, N, C = x.shape
-
+        B, N1, C = qr.shape
         # Generate Q, K, V.
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)  # Shape: [3, B, h, N, Ch].
-        q, k, v = qkv[0], qkv[1], qkv[2]                                                 # Shape: [B, h, N, Ch].
+        # Shape: [B, h, N, Ch].
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).transpose(2, 1)
+        kv = self.kv(qr).reshape(B, N1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+        print(k.shape, v.shape, q.shape)
 
         # Factorized attention.
         k_softmax = k.softmax(dim=2)                                                     # Softmax on dim N.
@@ -185,10 +192,10 @@ class FactorDecAtt_ConvRelPosEnc(nn.Module):
         factor_att        = einsum('b h n k, b h k v -> b h n v', q, k_softmax_T_dot_v)  # Shape: [B, h, N, Ch].
 
         # Convolutional relative position encoding.
-        crpe = self.crpe(q, v, size=size)                                                # Shape: [B, h, N, Ch].
+        #crpe = self.crpe(k, v, size=size)                                                # Shape: [B, h, N, Ch].
 
         # Merge and reshape.
-        x = self.scale * factor_att + crpe
+        x = self.scale * factor_att
         x = x.transpose(1, 2).reshape(B, N, C)                                           # Shape: [B, h, N, Ch] -> [B, N, h, Ch] -> [B, N, C].
 
         # Output projection.
@@ -277,6 +284,10 @@ class SerialDecodeBlock(nn.Module):
         self.factoratt_crpe = FactorAtt_ConvRelPosEnc(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, 
             shared_crpe=shared_crpe)
+        self.cross_attn_crpe = FactorDecAtt_ConvRelPosEnc(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+            shared_crpe=shared_crpe
+        )
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         # MLP.
@@ -284,19 +295,20 @@ class SerialDecodeBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, size):
+    def forward(self, x, qr, size):
         # Conv-Attention.
         x = self.cpe(x, size)                  # Apply convolutional position encoding.
         cur = self.norm1(x)
         cur = self.factoratt_crpe(cur, size)   # Apply factorized attention and convolutional relative position encoding.
         x = x + self.drop_path(cur) 
-
+        x = self.cross_attn_crpe(x, qr, size)
         # MLP. 
         cur = self.norm2(x)
         cur = self.mlp(cur)
         x = x + self.drop_path(cur)
 
         return x
+
 
 class ParallelBlock(nn.Module):
     """ Parallel block class. """
@@ -429,13 +441,11 @@ class PatchEmbed(nn.Module):
 class CoaT(nn.Module):
     """ CoaT class. """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dims=[0, 0, 0, 0], 
-                 serial_depths=[0, 0, 0, 0], parallel_depth=0,
+                 serial_depths=[[0], [0], [0], [0]], parallel_depth=0,
                  num_heads=0, mlp_ratios=[0, 0, 0, 0], qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                 return_interm_layers=False, out_features=None, crpe_window={3:2, 5:3, 7:3},
+                 drop_path_rate=0., norm_layer=partial(nn.LayerNorm, eps=1e-6), crpe_window={3:2, 5:3, 7:3}, out_features=['x4_nocls'],
                  **kwargs):
         super().__init__()
-        self.return_interm_layers = return_interm_layers
         self.out_features = out_features
         self.num_classes = num_classes
 
@@ -467,45 +477,28 @@ class CoaT(nn.Module):
         dpr = drop_path_rate
         assert dpr == 0.0
         
+        # for make layer function
+        self.num_heads = num_heads
+        self.qkv_bias = qkv_bias
+        self.qk_scale = qk_scale
+        self.drop = drop_rate
+        self.attn_drop = attn_drop_rate
+        self.dpr = dpr
+        self.norm_layer = norm_layer
+
+        self.layer_maps = serial_depths
         # Serial blocks 1.
-        self.serial_blocks1 = nn.ModuleList([
-            SerialBlock(
-                dim=embed_dims[0], num_heads=num_heads, mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr, norm_layer=norm_layer, 
-                shared_cpe=self.cpe1, shared_crpe=self.crpe1
-            )
-            for _ in range(serial_depths[0])]
-        )
+        self.serial_blocks1 = self.create_serial(embed_dims[0], mlp_ratios[0], serial_depths[0])
 
         # Serial blocks 2.
-        self.serial_blocks2 = nn.ModuleList([
-            SerialBlock(
-                dim=embed_dims[1], num_heads=num_heads, mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr, norm_layer=norm_layer, 
-                shared_cpe=self.cpe2, shared_crpe=self.crpe2
-            )
-            for _ in range(serial_depths[1])]
-        )
+        self.serial_blocks2 = self.create_serial(embed_dims[1], mlp_ratios[1], serial_depths[1])
 
         # Serial blocks 3.
-        self.serial_blocks3 = nn.ModuleList([
-            SerialBlock(
-                dim=embed_dims[2], num_heads=num_heads, mlp_ratio=mlp_ratios[2], qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr, norm_layer=norm_layer, 
-                shared_cpe=self.cpe3, shared_crpe=self.crpe3
-            )
-            for _ in range(serial_depths[2])]
-        )
+        self.serial_blocks3 = self.create_serial(embed_dims[2], mlp_ratios[2], serial_depths[2])
 
         # Serial blocks 4.
-        self.serial_blocks4 = nn.ModuleList([
-            SerialBlock(
-                dim=embed_dims[3], num_heads=num_heads, mlp_ratio=mlp_ratios[3], qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr, norm_layer=norm_layer, 
-                shared_cpe=self.cpe4, shared_crpe=self.crpe4
-            )
-            for _ in range(serial_depths[3])]
-        )
+        self.serial_blocks4 = self.create_serial(embed_dims[3], mlp_ratios[3], serial_depths[3])
+
 
         # Parallel blocks.
         self.parallel_depth = parallel_depth
@@ -520,26 +513,29 @@ class CoaT(nn.Module):
                 for _ in range(parallel_depth)]
             )
 
-        # Classification head(s).
-        if not self.return_interm_layers:
-            self.norm1 = norm_layer(embed_dims[0])
-            self.norm2 = norm_layer(embed_dims[1])
-            self.norm3 = norm_layer(embed_dims[2])
-            self.norm4 = norm_layer(embed_dims[3])
-
-            if self.parallel_depth > 0:                                  # CoaT series: Aggregate features of last three scales for classification.
-                assert embed_dims[1] == embed_dims[2] == embed_dims[3]
-                self.aggregate = torch.nn.Conv1d(in_channels=3, out_channels=1, kernel_size=1)
-                self.head = nn.Linear(embed_dims[3], num_classes)
-            else:
-                self.head = nn.Linear(embed_dims[3], num_classes)        # CoaT-Lite series: Use feature of last scale for classification.
-
         # Initialize weights.
         trunc_normal_(self.cls_token1, std=.02)
         trunc_normal_(self.cls_token2, std=.02)
         trunc_normal_(self.cls_token3, std=.02)
         trunc_normal_(self.cls_token4, std=.02)
         self.apply(self._init_weights)
+    
+    def create_serial(self, dim, mlp_ratio, layer_map):
+        layer = nn.ModuleList()
+        for i in layer_map:
+            if i == 0:
+                layer.append(SerialBlock(
+                    dim=dim, num_heads=self.num_heads, mlp_ratio=mlp_ratio, qkv_bias=self.qkv_bias, qk_scale=self.qk_scale,
+                    drop=self.drop, attn_drop=self.attn_drop, drop_path=self.dpr, norm_layer=self.norm_layer, 
+                    shared_cpe=self.cpe1, shared_crpe=self.crpe1
+                ))
+            else:
+                layer.append(SerialDecodeBlock(
+                    dim=dim, num_heads=self.num_heads, mlp_ratio=mlp_ratio, qkv_bias=self.qkv_bias, qk_scale=self.qk_scale,
+                    drop=self.drop, attn_drop=self.attn_drop, drop_path=self.dpr, norm_layer=self.norm_layer, 
+                    shared_cpe=self.cpe1, shared_crpe=self.crpe1
+                ))
+        return layer
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -570,107 +566,91 @@ class CoaT(nn.Module):
     def remove_cls(self, x):
         """ Remove CLS token. """
         return x[:, 1:, :]
+    
+    def run_block(self, x, qr, size, block, layer_map):
+        for blk, m in zip(block, layer_map):
+            if m == 0:
+                x = blk(x, size)
+            else:
+                x = blk(x, qr, size)
+        return x
 
-    def forward_features(self, x0):
+    def forward_features(self, x0, qrs):  # qrs = [qr0, qr1, qr2, qr3]
         B = x0.shape[0]
 
         # Serial blocks 1.
         x1, (H1, W1) = self.patch_embed1(x0)
         x1 = self.insert_cls(x1, self.cls_token1)
-        for blk in self.serial_blocks1:
-            x1 = blk(x1, size=(H1, W1))
+        x1 = self.run_block(x1, qrs[0], (H1, W1), self.serial_blocks1, self.layer_maps[0])
         x1_nocls = self.remove_cls(x1)
         x1_nocls = x1_nocls.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
         
         # Serial blocks 2.
         x2, (H2, W2) = self.patch_embed2(x1_nocls)
         x2 = self.insert_cls(x2, self.cls_token2)
-        for blk in self.serial_blocks2:
-            x2 = blk(x2, size=(H2, W2))
+        x2 = self.run_block(x2, qrs[1], (H2, W2), self.serial_blocks2, self.layer_maps[1])
         x2_nocls = self.remove_cls(x2)
         x2_nocls = x2_nocls.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
 
         # Serial blocks 3.
         x3, (H3, W3) = self.patch_embed3(x2_nocls)
         x3 = self.insert_cls(x3, self.cls_token3)
-        for blk in self.serial_blocks3:
-            x3 = blk(x3, size=(H3, W3))
+        x3 = self.run_block(x3, qrs[2], (H3, W3), self.serial_blocks3, self.layer_maps[2])
         x3_nocls = self.remove_cls(x3)
         x3_nocls = x3_nocls.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
 
         # Serial blocks 4.
         x4, (H4, W4) = self.patch_embed4(x3_nocls)
         x4 = self.insert_cls(x4, self.cls_token4)
-        for blk in self.serial_blocks4:
-            x4 = blk(x4, size=(H4, W4))
+        x4 = self.run_block(x4, qrs[3], (H4, W4), self.serial_blocks4, self.layer_maps[3])
         x4_nocls = self.remove_cls(x4)
         x4_nocls = x4_nocls.reshape(B, H4, W4, -1).permute(0, 3, 1, 2).contiguous()
 
         # Only serial blocks: Early return.
         if self.parallel_depth == 0:
-            if self.return_interm_layers:   # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
-                feat_out = {}   
-                if 'x1_nocls' in self.out_features:
-                    feat_out['x1_nocls'] = x1_nocls
-                if 'x2_nocls' in self.out_features:
-                    feat_out['x2_nocls'] = x2_nocls
-                if 'x3_nocls' in self.out_features:
-                    feat_out['x3_nocls'] = x3_nocls
-                if 'x4_nocls' in self.out_features:
-                    feat_out['x4_nocls'] = x4_nocls
-                return feat_out
-            else:                           # Return features for classification.
-                x4 = self.norm4(x4)
-                x4_cls = x4[:, 0]
-                return x4_cls
+            feat_out = {}   
+            if 'x1_nocls' in self.out_features:
+                feat_out['x1_nocls'] = x1_nocls
+            if 'x2_nocls' in self.out_features:
+                feat_out['x2_nocls'] = x2_nocls
+            if 'x3_nocls' in self.out_features:
+                feat_out['x3_nocls'] = x3_nocls
+            if 'x4_nocls' in self.out_features:
+                feat_out['x4_nocls'] = x4_nocls
+            return feat_out
 
         # Parallel blocks.
         for blk in self.parallel_blocks:
             x1, x2, x3, x4 = blk(x1, x2, x3, x4, sizes=[(H1, W1), (H2, W2), (H3, W3), (H4, W4)])
 
-        if self.return_interm_layers:       # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
-            feat_out = {}   
-            if 'x1_nocls' in self.out_features:
-                x1_nocls = self.remove_cls(x1)
-                x1_nocls = x1_nocls.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x1_nocls'] = x1_nocls
-            if 'x2_nocls' in self.out_features:
-                x2_nocls = self.remove_cls(x2)
-                x2_nocls = x2_nocls.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x2_nocls'] = x2_nocls
-            if 'x3_nocls' in self.out_features:
-                x3_nocls = self.remove_cls(x3)
-                x3_nocls = x3_nocls.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x3_nocls'] = x3_nocls
-            if 'x4_nocls' in self.out_features:
-                x4_nocls = self.remove_cls(x4)
-                x4_nocls = x4_nocls.reshape(B, H4, W4, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x4_nocls'] = x4_nocls
-            return feat_out
-        else:
-            x2 = self.norm2(x2)
-            x3 = self.norm3(x3)
-            x4 = self.norm4(x4)
-            x2_cls = x2[:, :1]              # Shape: [B, 1, C].
-            x3_cls = x3[:, :1]
-            x4_cls = x4[:, :1]
-            merged_cls = torch.cat((x2_cls, x3_cls, x4_cls), dim=1)       # Shape: [B, 3, C].
-            merged_cls = self.aggregate(merged_cls).squeeze(dim=1)        # Shape: [B, C].
-            return merged_cls
+        feat_out = {}   
+        if 'x1_nocls' in self.out_features:
+            x1_nocls = self.remove_cls(x1)
+            x1_nocls = x1_nocls.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
+            feat_out['x1_nocls'] = x1_nocls
+        if 'x2_nocls' in self.out_features:
+            x2_nocls = self.remove_cls(x2)
+            x2_nocls = x2_nocls.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
+            feat_out['x2_nocls'] = x2_nocls
+        if 'x3_nocls' in self.out_features:
+            x3_nocls = self.remove_cls(x3)
+            x3_nocls = x3_nocls.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
+            feat_out['x3_nocls'] = x3_nocls
+        if 'x4_nocls' in self.out_features:
+            x4_nocls = self.remove_cls(x4)
+            x4_nocls = x4_nocls.reshape(B, H4, W4, -1).permute(0, 3, 1, 2).contiguous()
+            feat_out['x4_nocls'] = x4_nocls
+        return feat_out
 
-    def forward(self, x):
-        if self.return_interm_layers:       # Return intermediate features (for down-stream tasks).
-            return self.forward_features(x)
-        else:                               # Return features for classification.
-            x = self.forward_features(x) 
-            x = self.head(x)
-            return x
 
+    def forward(self, x, qr):
+        return self.forward_features(x, qr)
 
 # CoaT.
 @register_model
 def coat_tiny(**kwargs):
-    model = CoaT(patch_size=4, embed_dims=[152, 152, 152, 152], serial_depths=[2, 2, 2, 2], parallel_depth=6, num_heads=8, mlp_ratios=[4, 4, 4, 4], **kwargs)
+    model = CoaT(patch_size=4, embed_dims=[152, 152, 152, 152], serial_depths=[[0,1],[0,1],[0,1],[0,1]], 
+        parallel_depth=6, num_heads=8, mlp_ratios=[4, 4, 4, 4], **kwargs)
     model.default_cfg = _cfg_coat()
     return model
 
@@ -689,7 +669,7 @@ def coat_small(**kwargs):
 # CoaT-Lite.
 @register_model
 def coat_lite_tiny(**kwargs):
-    model = CoaT(patch_size=4, embed_dims=[64, 128, 256, 320], serial_depths=[2, 2, 2, 2], parallel_depth=0, num_heads=8, mlp_ratios=[8, 8, 4, 4], **kwargs)
+    model = CoaT(patch_size=4, embed_dims=[64, 128, 256, 320], serial_depths=[[0,1],[0,1],[0,1],[0,1]], parallel_depth=0, num_heads=8, mlp_ratios=[8, 8, 4, 4], **kwargs)
     model.default_cfg = _cfg_coat()
     return model
 
@@ -710,6 +690,8 @@ def coat_lite_medium(**kwargs):
     model = CoaT(patch_size=4, embed_dims=[128, 256, 320, 512], serial_depths=[3, 6, 10, 8], parallel_depth=0, num_heads=8, mlp_ratios=[4, 4, 4, 4], **kwargs)
     model.default_cfg = _cfg_coat()
     return model
-# %%
-model = CoaT(patch_size=4, embed_dims=[64, 128, 320, 512], serial_depths=[2, 2, 2, 2], parallel_depth=0, num_heads=8, mlp_ratios=[8, 8, 4, 4],
-    return_interm_layers=True, out_features=['x4_nocls'])
+
+model = coat_lite_tiny()
+im = torch.rand(4, 3, 128, 128)
+qr = [torch.rand(4, 128, 64), torch.rand(4, 128, 128), torch.rand(4, 128, 256), torch.rand(4, 128, 512)]
+x = model(im, qr)

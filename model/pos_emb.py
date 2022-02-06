@@ -41,17 +41,16 @@ class PositionEmbeddingSine(nn.Module):
 
 
 class PositionEmbeddingSineMaskless(PositionEmbeddingSine):
-    def forward(self, im: torch.Tensor):
-        c, h, w = im.shape
-        y_embed = torch.arange(0, h, 1, dtype=im.dtype, device=im.device).unsqueeze_(1).tile(1, w)
-        x_embed = torch.arange(0, w, 1, dtype=im.dtype, device=im.device).unsqueeze_(0).tile(h, 1)
+    def forward(self, h, w, dtype, device):
+        y_embed = torch.arange(0, h, 1, dtype=dtype, device=device).unsqueeze_(1).tile(1, w)
+        x_embed = torch.arange(0, w, 1, dtype=dtype, device=device).unsqueeze_(0).tile(h, 1)
 
         if self.normalize:
             eps = 1e-6
             y_embed = y_embed / (y_embed[-1:, :] + eps) * self.scale
             x_embed = x_embed / (x_embed[:, -1:] + eps) * self.scale
 
-        dim_t = torch.arange(self.num_pos_feats, dtype=im.dtype, device=im.device)
+        dim_t = torch.arange(self.num_pos_feats, dtype=dtype, device=device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
 
         pos_x = x_embed[:, :, None] / dim_t  # [batch, y, x, num_pos_feats]
