@@ -208,6 +208,25 @@ def visualize_output(image: torch.Tensor, queries: List[torch.Tensor], bbox: tor
         plt.imshow(q.permute(1, 2, 0))
         plt.show()
 
+def visualize_model_output(image, queries, true_box, pred_box):
+    h, w = get_im_size(image)
+    image = T.unnormalize_im(image)
+    plt.imshow(image.permute(1, 2, 0))
+    ax = plt.gca()
+    for box in true_box:
+        box = T.unnormalize_box(w, h, box)
+        rect = Rectangle(box[:2], box[2] - box[0], box[3] - box[1], linewidth=1, edgecolor='g', facecolor='none')
+        ax.add_patch(rect)
+    for box in pred_box:
+        box = T.unnormalize_box(w, h, box)
+        rect = Rectangle(box[:2], box[2] - box[0], box[3] - box[1], linewidth=1, edgecolor='r', facecolor='none')
+        ax.add_patch(rect)
+    plt.show()
+    for q in queries:
+        q = T.unnormalize_im(q)
+        plt.imshow(q.permute(1, 2, 0))
+        plt.show()
+
 
 def compute_image_similarity(x, y, alpha=0.5):
     """score between 0 and 1; 1 is most similar"""
@@ -226,3 +245,7 @@ def compute_highest_similarity(queries: List[Image.Image], im: Image.Image, bbox
         score += max(scores)
     return score
 
+
+def alert_nan(x: torch.Tensor, message=""):
+    if torch.isnan(x).any():
+        print(message + " is nan.")

@@ -228,3 +228,23 @@ class SetCriterion(nn.Module):
 
         return losses
 
+
+def simple_box_loss(src, tgt):
+    src = src['pred_boxes']
+    num_boxes = src.shape[0] * src.shape[1]
+    if isinstance(tgt, list):
+        tgt = [d['boxes'] for d in tgt]
+        tgt = torch.cat(tgt, 0)
+    if src.dim() > 2:
+        src = src.flatten(0, 1)
+    loss_bbox = F.l1_loss(src, tgt, reduction='none')
+
+    losses = {}
+    losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+    assert torch.isnan(src).any() == False, 'src_boxes have nan results'
+    loss_giou = 1 - torch.diag(ops.generalized_box_iou(
+        ops.box_cxcywh_to_xyxy(src),
+        ops.box_cxcywh_to_xyxy(tgt)))
+    losses['loss_giou'] = loss_giou.sum() / num_boxes
+    return losses
+
