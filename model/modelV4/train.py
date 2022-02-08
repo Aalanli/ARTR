@@ -2,7 +2,7 @@
 import os
 
 import torch
-from model.modelV4.artr import ARTR
+from model.modelV4.artr import ARTR1
 from utils.loss import simple_box_loss, HungarianMatcher, SetCriterion
 
 import data.dataset as data
@@ -28,24 +28,27 @@ def get_parameters():
     args.weight_decay = 1e-4
     args.lr_drop = 200
     args.weight_dict = {'loss_giou': 2, 'loss_bbox': 5, 'loss_ce': 1}
-    args.name = 'ModelV4-tst'
+    args.name = 'ModelV4-tst1'
     return args
 
 args = misc.EasyDict(
-    n_pred      = 50,
-    x_dim       = 7,
-    splits      = 4,
-    im_dim      = 256,
-    im_depth    = 15,
-    qr_dims     = [64, 128, 256, 512],
-    qr_depths   = [3, 3, 6, 3],
-    mlp_depth   = 3,
-    mlp_feats   = 256,
-    min_qr_size = 64,
-    max_qr_size = 96
+    n_pred=50,
+    im_flatten_dim=8,
+    im_block_pattern=[0, 0, 1, 1],
+    im_repeats=2,
+    im_dim=256,
+    qr_depths=[3, 3, 4, 3],
+    qr_dims=[64, 128, 256, 512],
+    qr_flatten_dim=8,
+    qr_feats=64,
+    qr_mlp_depth=3,
+    mlp_depth=3,
+    mlp_feats=256,
+    min_qr_size=64,
+    max_qr_size=128
 )
 
-model = ARTR(**args).cuda()
+model = ARTR1(**args).cuda()
 args.update(get_parameters())
 matcher = HungarianMatcher(args.cost_class, args.cost_bbox, args.cost_giou)
 criterion = SetCriterion(1, matcher, args.cost_eof, args.losses).cuda()
@@ -78,7 +81,6 @@ train_set = torch.utils.data.DataLoader(dataset, args.batch_size, shuffle=True, 
 trainer.train_epochs(epochs, train_set)
 
 
-
 # %%
 #########################################
 ## Testing qualitatively
@@ -88,11 +90,11 @@ if __name__ == "__main__":
 
     #query_process = GetQuery(query_transforms(), 3, 2, stretch_limit=0.7, min_size=32,
     #                                query_pool=root + proc + "2017_query_pool", prob_pool=0.3, max_queries=10)
-    cpu_model = model.cpu()
-# %%
+
     im, qr, y = next(iter(train_set))
-    pred = cpu_model(im, qr)
-    pred_box = pred['pred_boxes'][0].detach()
-    true_box = y[0]['boxes']
-    visualize_model_output(im[0], qr[0], true_box, pred_box)
+    pred = model(trainer.recursive_cast(im, {'cuda': []}), trainer.recursive_cast(qr, {'cuda': []}))
+    pred_label = pred['pred_logits'][0].detach().softmax(-1)[:, 0].cpu()
+    pred_box = pred['pred_boxes'][0].detach().cpu()
+    true_box = y[0]['boxes'].cpu()
+    visualize_model_output(im[0], qr[0], true_box, pred_box, pred_label, 0.7)
 

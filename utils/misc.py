@@ -208,7 +208,7 @@ def visualize_output(image: torch.Tensor, queries: List[torch.Tensor], bbox: tor
         plt.imshow(q.permute(1, 2, 0))
         plt.show()
 
-def visualize_model_output(image, queries, true_box, pred_box):
+def visualize_model_output(image, queries, true_box, pred_box, probs=None, prob_thres=0.7):
     h, w = get_im_size(image)
     image = T.unnormalize_im(image)
     plt.imshow(image.permute(1, 2, 0))
@@ -217,10 +217,11 @@ def visualize_model_output(image, queries, true_box, pred_box):
         box = T.unnormalize_box(w, h, box)
         rect = Rectangle(box[:2], box[2] - box[0], box[3] - box[1], linewidth=1, edgecolor='g', facecolor='none')
         ax.add_patch(rect)
-    for box in pred_box:
-        box = T.unnormalize_box(w, h, box)
-        rect = Rectangle(box[:2], box[2] - box[0], box[3] - box[1], linewidth=1, edgecolor='r', facecolor='none')
-        ax.add_patch(rect)
+    for i, box in enumerate(pred_box):
+        if probs is None or (probs is not None and probs[i] > prob_thres):
+            box = T.unnormalize_box(w, h, box)
+            rect = Rectangle(box[:2], box[2] - box[0], box[3] - box[1], linewidth=1, edgecolor='r', facecolor='none')
+            ax.add_patch(rect)
     plt.show()
     for q in queries:
         q = T.unnormalize_im(q)
